@@ -85,8 +85,11 @@ agentcore/personas/*.md
 !agentcore/personas/assistant.md
 !agentcore/personas/fortune_teller.md
 
-# 个人脱敏词表（实际出现的人名/昵称），含隐私，不入库
-data/privacy/
+# 个人脱敏词表与真实标识清单（实际出现的人名/昵称/QQ 号/群号），含隐私，不入库。
+# 例外：隐私门禁的块名单只存 SHA-256（scripts/check_privacy.py 读取），必须随仓库走——
+# 门禁自己要能拦住「下次又提交真实值」，而它自己不能成为新的泄漏点。
+data/privacy/*
+!data/privacy/id-hashes.txt
 
 # 成本用量账本与运行日志（含聊天明文，绝不入库）
 data/budget/
@@ -95,6 +98,8 @@ data/logs/
 # LLM 沙箱工作区（本地临时/缓存）
 # SOUL.md / personas/ / cron/ 是**配置**（OpenClaw 兼容），要入库——默认人格与
 # 定时任务随仓库走，换机器/重建镜像都有；其余运行期产物仍忽略。
+# 纪律：cron/ 入库内容只能是**模板**（占位号 + `group:<群号>` 字面量），真实任务与
+# 真实群号只写本机、不入库；scripts/check_privacy.py 是这条纪律的 CI 门禁。
 data/workspace/*
 !data/workspace/SOUL.md
 !data/workspace/personas/
@@ -106,3 +111,10 @@ data/kb_samples/*
 
 # Mimosa 安全钩子的本地扫描状态（工具自产，不入库）
 .mimosa/
+
+# 本机工具产物（不属于项目内容）：DSH 的计划/会话目录里可能留存真实标识的明文副本，
+# 一律不入库；jieba 词典缓存与 pytest 临时根同理。
+.stepcode/
+pytest-of_*/
+pytest-of-*/
+jieba.cache

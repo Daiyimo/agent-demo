@@ -69,6 +69,13 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --extra dev
 
+      # 隐私门禁（2026-10-29 全历史脱敏整改 Phase 6）：真实 QQ 号/群号/内网地址
+      # 不得进入仓库。仓库是公开的，脱敏只清掉「已经进去的值」，这道是防复发——
+      # 块名单 data/privacy/id-hashes.txt 只存 SHA-256，门禁自己不是泄漏点。
+      # 放在 Lint 之前：泄漏应当在 1~2 秒内失败，而不是跑完 5 分钟测试才报。
+      - name: Privacy scan
+        run: uv run --no-sync python scripts/check_privacy.py
+
       - name: Lint
         run: uv run --no-sync ruff check agentcore plugins tests bot.py scripts
 
