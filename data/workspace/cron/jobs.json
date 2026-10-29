@@ -1,0 +1,34 @@
+{
+  "_说明": "OpenClaw 兼容的定时任务。每一条 = 到点让 agent 跑一轮（payload.message 当用户输入），把产出投递到 payload.to 指定的会话。",
+  "_说明_字段": "schedule.expr 是 5 段 cron；schedule.tz 缺省用 AGENT_SCHEDULER_TZ；payload.kind 只支持 agent_turn；payload.to 形如 group:<群号> / private:<QQ号>；enabled=false 临时停用；deleteAfterRun=true 跑成功一次后自动删除。",
+  "_说明_生效": "改完保存即生效（下一个轮询周期，默认 60s），无需重启。state 由程序自己回写，手改会被覆盖。",
+  "_说明_注意": "群目标必须在 config/agent.json 的 ALLOWED_GROUPS 白名单里，否则不会投递。",
+  "_说明_模板": "本文件是随仓库分发的**模板**：payload.to 用仓库通用占位号 123456789。真实群号 / QQ 号只写本机，不要提交回仓库——隐私纪律见 AGENTS.md §4 配置行。",
+  "version": 1,
+  "jobs": [
+    {
+      "id": "example-agent-turn",
+      "name": "示例：定时让 agent 跑一轮并投递到群（默认停用）",
+      "enabled": false,
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 */3 * * *",
+        "tz": "Asia/Shanghai"
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "示例任务：执行 <你的脚本>，把它的 stdout 原样用 message 工具发送到群聊。只发送一次，发完即停，不要补充说明、不要追问、不要延伸话题。",
+        "channel": "onebot",
+        "to": "group:123456789"
+      },
+      "state": {
+        "nextRunAtMs": 0,
+        "lastRunAtMs": 0,
+        "lastStatus": ""
+      },
+      "createdAtMs": 0,
+      "updatedAtMs": 0,
+      "deleteAfterRun": false
+    }
+  ]
+}
