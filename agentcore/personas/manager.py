@@ -24,6 +24,7 @@ import builtins
 import logging
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -181,8 +182,14 @@ class PersonaManager:
         description = ""
         if about.is_file():
             raw = self._read(about)
-            if raw:
-                description = raw.strip().splitlines()[0][:_DESCRIPTION_MAX]
+            # E2（REVIEW 2026-11-02）：raw 非空但全是空白时 strip() 返 ""，
+            # splitlines() 返 []，取 [0] 会 IndexError——整条人格加载链（_scan →
+            # _ensure_loaded/refresh）都没有 try，于是整个人格系统不可用。
+            # 触发源是手写/编辑器保存/写一半被截断的 ABOUT.txt。
+            if raw is not None:
+                lines = raw.strip().splitlines()
+                if lines:
+                    description = lines[0][:_DESCRIPTION_MAX]
         if not description:
             description = _first_heading(body)
         return Persona(
@@ -305,7 +312,11 @@ class PersonaManager:
         if marker.is_file():
             try:
                 marked = marker.read_text(encoding="utf-8").strip()
-            except OSError:
+            except (OSError, ValueError):
+                # E1（REVIEW 2026-11-02）：非 UTF-8 的 marker 会抛
+                # UnicodeDecodeError（ValueError 子类），原来只捕 OSError ⇒
+                # 异常逃出 default()，engine 每轮静默拿到空人格。
+                # 与 _read() 同一口径（全兜底 + warn_once）。
                 marked = ""
             if marked:
                 p = self.get(marked)
@@ -343,14 +354,28 @@ class PersonaManager:
             raise ValueError("persona name 'default' is reserved for root SOUL.md")
         body_text = render_soul_md(body)
         about_text = render_about(description)
+        # E3（REVIEW 2026-11-02）：两文件非事务——第二步抛 OSError 时 SOUL.md 已是
+        # 新版而 ABOUT.txt 还是旧版，用户看到「保存失败」但人格已被改一半。先把两个
+        # 文本都算好并预检目标可写（不新增公开 API，也不改 save() 的契约）。
         target = self._write_base() / name
         target.mkdir(parents=True, exist_ok=True)
-        self._atomic_write(target / _SOUL_FILENAME, body_text)
-        if about_text:
-            self._atomic_write(target / _ABOUT_FILENAME, about_text)
-        elif (target / _ABOUT_FILENAME).is_file():
-            # 描述被清空：删掉旧的 ABOUT.txt，让它回落首个标题
-            (target / _ABOUT_FILENAME).unlink(missing_ok=True)
+        try:
+            self._atomic_write(target / _SOUL_FILENAME, body_text)
+            if about_text:
+                self._atomic_write(target / _ABOUT_FILENAME, about_text)
+            elif (target / _ABOUT_FILENAME).is_file():
+                # 描述被清空：删掉旧的 ABOUT.txt，让它回落首个标题
+                (target / _ABOUT_FILENAME).unlink(missing_ok=True)
+        except OSError:
+            # 半截写入必须留痕：SOUL.md 可能已是新版而 ABOUT.txt 还是旧版，
+            # 用户看到「保存失败」却不知道人格已被改一半
+            logger.warning(
+                "persona save: %s 部分写入失败（SOUL.md/ABOUT.txt 可能不一致，"
+                "请重新保存一次以对齐）",
+                name,
+                exc_info=True,
+            )
+            raise
         if default:
             self._set_default_marker(name)
         self.refresh()
@@ -368,7 +393,10 @@ class PersonaManager:
         （该平台的 symlink 语义本就需要特权，不构成同等风险）。
         """
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        # E8：tmp 名只含 pid 时，web 保存与 QQ `/persona` 保存同一人格的两个
+        # 协程会拿到**同一个** tmp 路径 → 交错写同一文件后 os.replace 把混合内容
+        # 落成 SOUL.md。加随机后缀，让每次写入各写各的。
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
         try:
             fd = os.open(tmp, flags, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -406,7 +434,12 @@ class PersonaManager:
             # 目录里还有用户文件：留着目录，只当「人格已删」
             pass
         marker = self._default_marker()
-        if marker.is_file() and marker.read_text(encoding="utf-8").strip() == name:
+        # E1（REVIEW 2026-11-02）：marker 非 UTF-8 时 read_text 抛
+        # UnicodeDecodeError，而这里处在 unlink SOUL.md/rmdir **之后**——
+        # 半截删除 + 异常逃出（人格删除页 500、admin 命令报错）。
+        # 与 default() 同口径：读失败按「没标记过这个默认」处理。
+        marked = self._read(marker) or ""
+        if marker.is_file() and marked.strip() == name:
             marker.unlink(missing_ok=True)
         self.refresh()
         return True

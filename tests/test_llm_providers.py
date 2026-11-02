@@ -14,12 +14,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from agentcore import boolenv
 from agentcore.llm import providers as ps
 
 
@@ -68,6 +70,22 @@ class TestValidate:
         assert ps.validate_provider({**base, "enabled": "false"}).enabled is False
         assert ps.validate_provider({**base, "enabled": "0"}).enabled is False
         assert ps.validate_provider({**base, "enabled": "true"}).enabled is True
+
+    def test_enabled_dirty_value_warns_and_falls_back_to_default(self, caplog):
+        """G（REVIEW 2026-11-02）：脏值不得静默按「开」——provider 列表是 web
+        面板手写的 0600 JSON，拼错 ``disabled`` 时旧手解当成开着。
+        """
+        base = {
+            "name": "x",
+            "protocol": "openai",
+            "endpoint": "http://h",
+            "model": "m",
+        }
+        boolenv._warned.clear()
+        with caplog.at_level(logging.WARNING, logger="agentcore.boolenv"):
+            got = ps.validate_provider({**base, "enabled": "disabled"})
+        assert got.enabled is True
+        assert "不是布尔值" in caplog.text and "disabled" in caplog.text
 
     def test_ok(self):
         p = ps.validate_provider(

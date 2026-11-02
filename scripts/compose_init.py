@@ -297,21 +297,42 @@ _FALLBACK_CRON = """{
 """
 
 
+def _copy_0600(src: Path, target: Path) -> None:
+    """C6（REVIEW 2026-11-02）：把 ``src`` 复制到 ``target`` 并创建即 0600。
+
+    原实现 ``shutil.copyfile`` → ``os.chmod``：copyfile 用 ``builtins.open``
+    不传 mode，umask 022 下先落 0644，chmod 之前那一跳对同机其它本地用户
+    可读。jobs.json 里是定时任务的完整指令，按「创建即 0600」口径写死。
+    """
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        # Windows 无 POSIX 权限语义（只读位除外），别让自举因此失败
+        pass
+    with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+        shutil.copyfileobj(inp, out)
+
+
 def _write_cron_jobs(target: Path, root: Path) -> None:
     """首启放一份定时任务模板；模板缺失时写空任务表（不阻塞启动）。"""
     template = CRON_TEMPLATE if CRON_TEMPLATE.is_file() else root / CRON_TEMPLATE.name
     if template.is_file():
-        shutil.copyfile(template, target)
+        _copy_0600(template, target)
     else:
         print(
             f"WARNING: 定时任务模板 {CRON_TEMPLATE} 不存在，已写入空 jobs.json",
             file=sys.stderr,
         )
-        target.write_text(_FALLBACK_CRON, encoding="utf-8")
-    try:
-        os.chmod(target, 0o600)
-    except OSError:
-        pass
+        # C6：兜底路径同样创建即 0600（write_text 走 umask 会先落 0644）
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            # Windows 无 POSIX 权限语义（只读位除外）
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_FALLBACK_CRON)
 
 
 def bootstrap(app_root: Path, *, source_config: Path | None = None) -> dict[str, str]:

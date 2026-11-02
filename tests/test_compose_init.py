@@ -462,6 +462,69 @@ class TestGeneratedJsonIsActuallyLoadable:
         # 清理交给 autouse fixture，这里不手工 pop（漏清会污染其它模块）
 
 
+class TestCronJobsHardening:
+    """C6（REVIEW 2026-11-02）：jobs.json 必须创建即 0600。
+
+    compose_init 是 importlib 动态加载的模块（``ci``），fchmod/chmod 的 spy 要
+    patch 它自己的 ``os`` 引用才有效。
+    """
+
+    def test_template_branch_creates_strict_no_post_chmod(self, tmp_path, monkeypatch):
+        seen: list[int] = []
+        chmod_paths: list[str] = []
+        real_fchmod = ci.os.fchmod
+        real_chmod = ci.os.chmod
+
+        def _spy_fchmod(fd, mode):
+            seen.append(mode)
+            return real_fchmod(fd, mode)
+
+        def _spy_chmod(path, mode):
+            chmod_paths.append(str(path))
+            return real_chmod(path, mode)
+
+        monkeypatch.setattr(ci.os, "fchmod", _spy_fchmod)
+        monkeypatch.setattr(ci.os, "chmod", _spy_chmod)
+        template = tmp_path / "cron-jobs.example.json"
+        monkeypatch.setattr(ci, "CRON_TEMPLATE", template)
+        template.write_text('{"jobs": []}', encoding="utf-8")
+        target = tmp_path / "data" / "cron" / "jobs.json"
+        target.parent.mkdir(parents=True)
+        ci._write_cron_jobs(target, tmp_path)
+        # 创建即 0600：fchmod 被以 0o600 调用，且 .part/目标文件上没有事后 chmod
+        assert seen == [0o600]
+        assert chmod_paths == []
+        assert json.loads(target.read_text(encoding="utf-8")) == {"jobs": []}
+
+    def test_fallback_branch_creates_strict_no_post_chmod(self, tmp_path, monkeypatch):
+        seen: list[int] = []
+        chmod_paths: list[str] = []
+        real_fchmod = ci.os.fchmod
+        real_chmod = ci.os.chmod
+
+        def _spy_fchmod2(fd, mode):
+            seen.append(mode)
+            return real_fchmod(fd, mode)
+
+        def _spy_chmod2(path, mode):
+            chmod_paths.append(str(path))
+            return real_chmod(path, mode)
+
+        monkeypatch.setattr(ci.os, "fchmod", _spy_fchmod2)
+        monkeypatch.setattr(ci.os, "chmod", _spy_chmod2)
+        monkeypatch.setattr(ci, "CRON_TEMPLATE", tmp_path / "missing.json")
+        target = tmp_path / "data" / "cron" / "jobs.json"
+        target.parent.mkdir(parents=True)
+        # root 指向不存在的目录 ⇒ 模板也找不到 ⇒ 走兜底分支
+        ci._write_cron_jobs(target, tmp_path / "nowhere")
+        assert seen == [0o600]
+        assert chmod_paths == []
+        assert json.loads(target.read_text(encoding="utf-8")) == {
+            "version": 1,
+            "jobs": [],
+        }
+
+
 class TestRealTemplate:
     """看守真实文件：本模块依赖的行必须在仓库里真实存在。"""
 

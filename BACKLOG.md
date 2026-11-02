@@ -245,314 +245,75 @@ key-value override，动 store 双实现契约）；"动 .env" 触碰"全部 env
 | 2.3（P1） | **Dockerfile** | README 自己写「根治方案是容器/独立低权用户运行」，但 compose 里只有 `db`，安全声明未兑现 | 单容器 + 非 root + `--cap-drop ALL` + 出口白名单；**不要挂 `docker.sock`**（改用镜像内 `postgresql-client` 直连 `db`） |
 | 2.4（P2） | `/healthz` + 轻量 `/metrics` | fastapi driver 自带 HTTP 服务，成本很低 | turn 数、LLM 耗时、错误率、缓存命中 |
 | 2.5（P2） | `config.yaml` pydantic 校验 + 结构化日志（turn_id 串联） | 字段写错只静默用默认值；一次 turn 的步骤散在各处 INFO | 启动 fail-fast；turn_id 串起 LLM/skill 调用 |
-| **2.6（P1）** | **Web 只读总览** | 运维只能靠 QQ 里 `/status` 和翻日志；`/healthz`+`/metrics` 一直没做 | **首期已完成**（`plugins/qq_agent_adapter/web.py`）：挂在现有 FastAPI 上、`/agent-web` 前缀、Bearer token（未配 `AGENT_WEB_TOKEN` 不挂载）+ 可选 IP 白名单 + 只读。展示 LLM 主/备实时线路、协议端连接、今日/历史 token 与成本（按模型）、组件与 KB 统计、`diagnostics` 最近事件。**后续（未做）**：`/healthz` `/metrics`、写入类功能（配置编辑 / 记忆删除 / skill 安装——须配审计+二次确认+改前备份） |
-| **2.8（P1）** | **群统计四表 DDL 纳入版本化迁移** | `group_msg_daily`/`group_word_daily`/`group_reviews`/`group_messages_raw` 由 `groupstats/store.py`、`raw.py` 内嵌 `CREATE TABLE IF NOT EXISTS` 自建，绕过 `schema_migrations` 的校验和与版本守卫（M7，[REVIEW-ee39c8e..e55cab5](review/REVIEW-ee39c8e..e55cab5.md)）；`AGENTS.md` §4 已把该例外写明，并有 `test_stats_tables_match_embedded_ddl` 防止表清单漂移 | 新增 `0002_stats.sql` 并注册；`PgStatsStore`/`RawArchiveStore.init()` 改为不建表（依赖启动期迁移），再把 groupstats 的 PG 用例夹具接上 `migrate()`；需在全新空库复核 |
-| **2.7（P1）** | **CI 全量套件用错位时区跑** | `agentcore.tz` 已把「今天」统一为 Asia/Shanghai，但任何新代码/测试桩只要用裸 `date.today()`/`datetime.now()` 写日键，就**只在 UTC runner 的北京 0–8 点窗口（=UTC 16–24 点）与生产错开一天**——CI 平时绿、撞窗口才红，三次实红：`0bc7905`（概览时钟）、`839ca7e`（每周提醒）、`f782812→2820b04`（budget/usage 账本） | CI 测试步骤加 env `TZ: Pacific/Midway`（UTC-11，任意时刻都与 Asia/Shanghai 不同日，每次运行都暴露日键错位，零新增时长）；本地复现同理 `TZ=Pacific/Midway pytest -q`。备选：双时区矩阵 job（pytest 时长翻倍，不推荐）。**验收**：把任一日键故意改回 `date.today()` 后该 job 必红 |
-
 ---
 
-## 3. 里程碑状态
+## 7. 架构债（2026-11-02 全量评审识别，均未修）
 
-| 里程碑 | 状态 |
-|---|---|
-| M0–M4 基础链路 / 记忆 / 人格 / 工具 | ✅ 完成 |
-| **M5 RAG** | ✅ 完成（含注入防护与脱敏） |
-| **M6 多 Agent** | ⬜ **空壳**（`agentcore/multiagent/__init__.py`）—— 见 §5，**建议缓做** |
-| **M7 调度 / 预算 / 归档 / 定时内容推送** | ✅ 全部完成：调度（`kb_digest`、`archive_prune`、`db_backup`、`reminders`、`push` 五个 job）、成本预算（`be13897`）、日志归档、定时内容推送（`agentcore/scheduler/push.py`） |
+来源：上游 a9a28cf 评审 + 本 fork 六路只读子代理并行评审（RAG/embedding、记忆库/群统计、
+渲染/点歌/人格、消息适配层、技能/沙箱、备份脚本/LLM 客户端）+ 主代理自审未覆盖模块。
+本轮已修的全部为**正确性/安全/数据完整性**类（群统计双计、归档 mid 碰撞、创建即 0600 八处、
+人格半截删除、备份脚本 compose 形态、技能越权、孤儿进程、识图预算架空、布尔配置静默失效等）；
+下面这些是**结构性问题**，改动面大、收益不在本轮范围，逐条记档以免丢失。
 
----
+### 7.1 Web 单体（`plugins/qq_agent_adapter/web.py`，5165 行）
 
-## 4. 建议迭代顺序
-
-- **迭代 1（地基，1–2 天）**：A1 token 用量 → `/cost` → 预算熔断 → C4 限流
-- **迭代 2（质量与隐私，1–2 天）**：A2 历史裁剪 + 滚动摘要 → B1 `/memory` → B2 `/export`
-- **迭代 3（安全网，半天）**：2.1 PG 进 CI → 2.2 恢复演练
-- **迭代 4（体验）**：C1 重试退避 → C3 工具并行 → C2 turn 超时 → 群聊免前缀窗口
-- **之后**：2.3 Dockerfile → 落地后再评估 M6
-
-> 一句话：功能面（记忆/人格/技能/RAG/沙箱/备份）已超出 demo 水准，
-> 现在缺的是「能不能放心让它多说话」——看得见花钱、扛得住长会话、
-> 用户能删掉自己的记忆、以及一份**真演练过**的备份。
-
----
-
-## 5. 明确暂不做（含理由）
-
-| 项 | 理由 |
-|---|---|
-| **M6 多 Agent** | 现有 30+ 工具 + 单 loop 已够跑通场景；多 Agent 会先抬高三样**当前正好看不见**的东西：延迟、成本、调试复杂度。建议先把 §1 A1 的账和 §1 C 组的稳定做掉 |
-| MCP 客户端 | 能力扩张项，前提同上 |
-| 语音 ASR/TTS、文生图 | 感知强但纯增量，且引入新的媒体下载/存储面（`media.py` 那套 SSRF 防护要再来一遍） |
-| 点歌语音的"真送达"确认 | SnowLuma issue #422：语音 highway 上传失败时协议端误报 ok + message_id，上层拿不到真失败。MVP 接受该风险：发送成功只记 message_id 与载荷大小（排查"用户说没收到"的唯一线索），且**绝不重发**；真失败需带外确认。见 `agentcore/music/sender.py` 与 `review/AC-music-playback.md` C4 |
-| 点歌语音的多账号串号 | HTTP 发送用哪个账号由 `NAPCAT_HTTP_URL` 指向的协议端决定，无法指定"触发事件的 bot"。单账号部署无影响，记为已知取舍不修。见 `agentcore/music/sender.py` C5 |
-| 敏感内容过滤 | 面向陌生公开群时才是必要项 |
-| 流式输出 | QQ 分条发送体验提升有限，且与 debounce/分段逻辑耦合；可选 |
-| 群聊免前缀窗口 | 纯体验项，改动局部，可随时穿插进任意一次提交 |
-| **字体子集化瘦身（2026-10-16 实测后暂不做）** | 目标：`data/fonts/wqy-zenhei.ttc` 16.8 MB 占全部跟踪内容的 ~80%（`review/` 仅 892 KB，不动）。用 `pyftsubset --font-number=0` 实测三档：CJK+拉丁+标点 **7.3 MB**（覆盖损失 21082/42285 = **49.9%**：丢谚文 11172 + 扩展A 6582 + 非BMP 649 等）、+扩展A **9.7 MB**（丢 33.8%）、+谚文/全东亚 **11 MB**（丢 7.4%：西里尔/希腊/非BMP）。覆盖到的文本渲染逐像素一致（PIL 哈希相同），但本仓字体链是**单一字体、无逐字形回退**（`agentcore/render/fonts.py`），缺字即豆腐块——损失不可接受。替代方案：① **浅克隆**（已写入 README/CONTRIBUTING：`--depth 1` / `--filter=blob:none`）；② 若日后仍要减重，走**按需下载**（不发字体，缺字体时现有候选链会降级为文本，无豆腐块；需自托管一份带校验和的固定 URL）——未实施 |
-| **点歌触发回退成确定性直路由** | 已按用户要求从「唤醒词 + 点歌/放歌 子命令」**改为 LLM skill**（`play_music`，模型判断是否放歌）。代价已知且接受：① 模型可能不触发/误触发（原 AC G 段"结构性消除"不再成立，改由 handler 四道硬闸兜底：群白名单 / 私聊 superuser / 歌名校验 / 账号级冷却）；② `superusers: ["*"]` 部署下未授权群从"静默"变"明拒"；③ 每次点歌多一次 LLM 往返。序号选歌保留确定性 matcher 兜底。若体验回退，可改回并在 `review/AC-music-playback.md` 记档 |
-
----
-
-## 6. 已实证缺陷（必修，非新功能）
-
-来源：[`review/REVIEW-8cfbf6d..a604023.md`](review/REVIEW-8cfbf6d..a604023.md)（5 线并行子代理 + 主代理逐条实证）。
-这些是**已复现**的问题，优先于 §1 的新功能；修复阶段另出 `review/FIX-8cfbf6d..a604023.md` 记录改法与回归。
-其中最后两条由 `tests/test_perf.py`（`RUN_PERF=1`）在 2026-09-11 实测确认并已修复，属**已量化**但真实场景影响小
-（`_qq_plain` 输入为单条回复，通常 <8KB → 毫秒级；`merge_parts` 的 part 数受防抖窗口约束，通常个位数）。
-
-| 级别 | 问题 | 位置 |
+| 项 | 现状 | 代价 |
 |---|---|---|
-| **H** | 公共库数字脱敏的分隔符类不完整：22 种写法中 **18 种穿透**（`/ _ , ， 、 \| \ + ( ) ‧` 及零宽字符） | `rag/sanitize.py` |
-| M | 沙箱 `curl` 的数字型 IP 字面量绕过内网判定（`2130706433` / `0177.0.0.1` / `0x7f000001` 实测真连上 127.0.0.1） | `workspace/runner.py` |
-| M | 蒸馏两条静默路径：单条消息截断后水位线仍推进（尾部永久丢失、无日志）；极短消息占满 batch 窗口导致**永久停更** | `rag/distill.py` |
-| M | 检索结果（`search_web` / `search_multi`）未套不可信围栏 | `skills/search.py` |
-| M | 完整性链路断在恢复端：restore 从不校验 sidecar；镜像只复制主文件、不复制 `.sha256` | `backup/db_backup.py` |
-| M | 双实现契约分歧：内存 `kb_add_chunks` 无去重（PG 有）、`list_facts` 排序不一致、私聊判定靠解析字符串 | `memory/store.py` |
-| M | 人名/昵称防护在默认配置下几乎不生效（词表为空 + 句式覆盖窄） | `rag/sanitize.py` / `rag/distill.py` |
-| L | 13 项（围栏标记未转义、沙箱 HOME 临时目录不回收、cron 失败重试丢周期语义、归档 id 截断等） | 见报告 §1 L 级表 |
-| L | ✅ **已修**（2026-09-11）`_qq_plain` 超线性：原逐代码块 `str.replace` 全串还原为 O(n²)，实测 75k 63ms → 300k 1.28s → 600k 5.00s；改为单次 `re.sub` 回调后 600k **56ms**（线性，~89×） | `plugins/qq_agent_adapter/matcher.py` |
-| L | ✅ **已修**（2026-09-11）`merge_parts` 图片去重 O(n²)：原 `img not in images` 列表扫描 + 返回时才裁剪；改为 `set` 判定并命中上限即停，800 part/16000 图 2005ms → **0.1ms** | `plugins/qq_agent_adapter/pipeline.py` |
+| 单文件 5165 行 | 8 个闭包路由组挂在 `mount_web` 里 | 任何改动都要在 5000 行里定位；diff 冲突面大 |
+| 路由注册不可静态枚举 | `importlib` 字符串式条件装载 | 新增面时容易漏挂鉴权/审计/2FA 三件套 |
+| `AGENTS.md` 配置优先级表述脱节 | 文档与 `config_json.py` 的实际优先级链有偏差 | 接手者按文档推理会得出错误结论 |
+| 无 ADR | 重大决策只散落在 `review/` 与 commit message | 「为什么这样」不可检索 |
 
-> 另有 2 项被主代理**证伪**（子代理报的 `save_fact` 丢作用域条件、私人物件启发误杀 9/12），
-> 不要按它们改代码 —— 详见报告 §2。
+建议拆法（未实施）：按现有 8 个闭包分组切成 `web/routes/<组>.py`，共享鉴权/2FA/审计提取为
+中间件式依赖；先补「路由表 + 每路由的鉴权等级」快照测试再动手，防止拆的过程中漏挂门禁。
 
-### 6.1 规范审查新增（来源：[`review/REVIEW-a604023..679c9b3.md`](review/REVIEW-a604023..679c9b3.md)，修复见 [`review/FIX-a604023..679c9b3.md`](review/FIX-a604023..679c9b3.md)）
+### 7.2 `agentcore/llm/client.py` 两条候选循环（真缝）
 
-4 条并行子代理取证 + 主代理逐条复核（5 条 H 全部亲自复现）。**H 级已全部修复**：
+`_chat_providers`（:387-440）与 `chat()` 的 env 路径（:655-718）是两份近似重复的候选/重试/降级
+状态机——都是「idx==0 重试 `_PRIMARY_ATTEMPTS`(=2) 次 + `_RETRY_BACKOFF_SECONDS`(=0.5)s 退避、
+失败换下一个、全失败抛 last_err」，差别只在状态字段（providers 版记 `_last_served_provider`/
+`_provider_previous`；env 版管 `_using_fallback`/`_previous`/`_last_served`）。删任何一份，
+复杂度都会在另一份复现。
 
-| 级别 | 问题 | 位置 | 状态 |
-|---|---|---|---|
-| **H** | 沙箱 `zip` 参数零校验 → `-T -TT`/`--unzip-command` 任意命令执行 | `workspace/runner.py` | ✅ 已修（白名单开关 + 禁 `=` 参数） |
-| **H** | 沙箱 `curl` 只校验含 `://` 的参数 → 裸内网地址绕过判定实读 loopback | `workspace/runner.py` | ✅ 已修（所有非选项参数当 URL 校验） |
-| **H** | `calc` 的 `pow()` 绕过静态守卫 → 阻塞事件循环 7.19s / 473MB（public 权限） | `skills/basic_tools.py` | ✅ 已修（`pow` 调用纳入守卫） |
-| **H** | `httpx` 超时被判为"确定未送达" → NapCat 降级重发，用户收到两遍 | `skills/file_sender.py` | ✅ 已修（补 `httpx.TimeoutException`） |
-| **H** | 停机钩子逆序 → flush 在连接池关闭后跑，重启必丢一批消息（降级 `[echo]`） | `lifecycle.py` + `bot.py` + 插件钩子 | ✅ 已修（顺序固定 + 幂等） |
+建议顺序：先收敛成统一的 `_FallbackState`，再加「两条路径行为等价」的参数化测试，
+最后才抽 `_run_chain`。跳过前两步直接抽 = 没有安全网的重构。
 
-**M 级 19 条全部已修**（按报告 §2 表格行数分组：安全/注入 3、存储契约 4、备份/归档/蒸馏 6、并发/资源 6。
-报告表头与 FIX 文档曾写「17 条」是批二时的已知数——存储第 4 条（负 `limit`/`top_k`）与备份第 6 条
-（`_backup_jsonl` 整表 fetch）在第四批随共享契约测试 / 游标流式关闭，见 [`review/FIX-679c9b3..c472e56.md`](review/FIX-679c9b3..c472e56.md) 的口径统一说明）。
+### 7.3 `pipeline.py` `_build` 336 行内嵌 6 个「有没有图」判据
 
-**第四批（已完成，见 FIX 文档 §"第四批"）**：
+`plugins/qq_agent_adapter/pipeline.py:751-1086` 的 `_build` 里并列 6 个互不等价的图片来源判据：
+`direct_media` / `had_image_segments` / `quoted_imgs` / `fwd_imgs` / `history_imgs` /
+`recent_images.get`。本轮 F1（群历史回捞图被 `recent_images` 缓存静默覆盖）正是漏判一项的直接后果。
 
-| 项 | 结果 |
-|---|---|
-| `_backup_jsonl` 整表 `fetch` 进内存 | ✅ 改为 `conn.cursor(...)` 游标流式 + 每 500 行 `to_thread` 序列化；失败清理 `.part`；回归见 `tests/test_backup.py`（原 `test_backup_jsonl.py`，b688317 更名；初建 7 条现 12 条，含真库 1200 行用例） |
-| **共享契约测试缺失**（内存 vs PG 各测各的） | ✅ 新增 `tests/test_store_contract.py`：同一批断言参数化跑两个实现（初建 20 条，现 36 条）。**顺带查出并修掉 4 处此前未发现的漂移**：`list_facts`/`recall_facts` 负 limit 在 PG 直接抛 `LIMIT must not be negative`、`kb_search`/`kb_list_sources`/`messages_after`/`schedule_due` 非正 limit 两实现语义不同（内存"去掉最后 N 条" vs PG 抛错）、`kb_last_digest_watermark` 内存取 max 而 PG 取最新来源 |
-| 假通过用例余项 | ✅ 全部加固并逐条变异复核（见下） |
-| 文档/工程余项 | ✅ 本文件数字刷新 + 新增根 `AGENTS.md` 交接文档 |
+建议抽单一 `ImageSupply` 值对象：五个互斥来源（direct/quoted/forwarded/history/cached）+ 显式优先级
++ `is_empty()`，`_build` 改为对其查询。
 
-**测试加固明细（第四批，均已用"改坏实现→用例必须失败"复核）**：
-- `test_outbound.py`：恒真断言 `"超过软上限" not in caplog.text`（该字符串全仓不存在）→ 改为"该路径不得产生任何 WARNING"；`_repack_chunks` 真实覆盖（新增 `test_repack_enables_forward_instead_of_spamming`：禁用重打包必然落到逐条发送而失败）；nickname 参数传递（显式值 / env 兜底两条，忽略参数必然失败）
-- `test_pipeline.py`：空消息与纯图片消息由 `assert text.strip()` 改为断言**具体文案**；补 `_display_key`（base64/内联数据掩码、文件名清洗截断）与 `_download_for_su`（非管理员只回显掩码出处、管理员落盘相对路径、下载失败备注）——两组此前**零引用**
-- `test_file_sender.py`：`_napcat_upload_private_file` 此前**从未被执行**，补 5 条（base64 载荷字段/鉴权头/无 token/异常返回原文/公开入口优先走 NapCat 而不回落 OneBot）
+### 7.4 子进程启动策略四套并存
 
-**L 级 19 条**与**测试补强**见报告 §3–§4，其中 ✅ 已修：`acl` 私聊拒绝零覆盖、`ruff format` 门禁、
-PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `AGENT_SKILLS_DIR`；
-假通过用例上轮点名的 8 条中 6 条在三四批加固，**漏掉的 2 条已在本轮（FIX-679c9b3..c472e56）补修**。
+`agentcore/workspace/runner.py`、`agentcore/skills/shell_skill.py`、`action_skills.py`（npm_update）、
+action_skills.py`（run_build_script）、`command_util.py`、`ssh_skill.py` 六处的 env/进程组/超时杀法
+原本四套并存。本轮 D1 已逐站点补齐 `start_new_session=True` + `os.killpg`，B2 已给
+`command_util.py` 补最小 env；**未抽共用的 `spawn_guarded(cmd, *, cwd, env, timeout, kill_group=True)`**。
 
-### 6.2 第四批复核中新发现的小项（非必修，记录以免丢失）
+不抽的理由（AGENTS.md §2.5 最小改动）：跨文件抽公共函数会把 4 个模块的 logger/返回值/超时文案
+差异卷进来，风险与收益不成比例。若日后再抽，须连同六处的超时文案差异一起设计。
 
-| 项 | 说明 |
-|---|---|
-| 带图占位分支不可达 | `pipeline.py` 的 `"（请结合用户发来的图片回答）"` 只在 `extra_images` 非空且 `text` 为空时命中，而每张进入 `extra_images` 的图片都必然先写一条 notes → 该占位实际不可达（保留作防御）。无图占位 `"（用户没有输入文字内容）"` 可达并已被断言锁定 |
-| `_reconstruct_content_from_memory` 是死桩 | `skills/file_sender.py` 该函数恒返回 `""`（读 `driver._agent_memory` 后直接 `return ""`），当前无人调用 |
-| `LLMClient.embeddings` 无调用方 | `agentcore/llm/client.py` 的 embeddings 方法无生产调用点（embedding 走 `agentcore/embedding/client.py`）；环境变量 `LLM_EMBEDDING_MODEL` 因此未入 `.env.example` 文档——属已知死代码路径，记录结论，不补文档 |
+### 7.5 全仓零目录 fsync
 
-### 6.3 线上实测：上下文丢失与记忆投毒三连（2026-09-28，已修复）
+`os.replace` 站点 12 处（`budget.py:222`、`db_backup.py:228/266/628/704`、`totp.py:80`、
+`llm/providers.py:350`、`workspace/fs.py:168`、`personas/manager.py:377`、`search_providers.py:238`、
+`push.py:612`、`nudge.py:635/947`、`jobs.py:366`），文件级 fsync 只 4 处，**父目录 fsync 0 处**。
+掉电时 rename 可能不持久（ext4 `data=ordered` 下影响有限；NAS 部署目标值得注意）。
 
-现象（`data/logs/agent.log` 15:45–15:50，群 2000000003）：用户引用他人消息问
-「他是不是嘉豪」，连续两轮得到「消息里没标是谁发的」；追问「我明明艾特的还有
-一个人」后，模型自称"**记忆抽取器**"并称"只看到 @ 和引用"。
+### 7.6 配置单一事实源（上一轮 B 组，仍未修）
 
-| 级别 | 根因 | 位置 | 修复 |
-|---|---|---|---|
-| **M** | `at` 段被静默丢弃：`@bot @群友` 里被 @ 的群友对模型完全不可见，指代无法解析 | `pipeline._build_user_text` / `media.text_from_segments` | ✅ `at` 段文本化为 `[@QQ:号]` 占位（@bot 不重复占位；全角数字脏数据丢弃） |
-| **M** | 引用围栏只说「其他用户发送」，无发送者归属，「他是不是XXX」无据可依 | `pipeline._resolve_reply` / `_build` | ✅ 围栏头部注明原发送者（群名片+QQ；昵称打散空白/去括号/截断，防围栏伪造） |
-| **M** | **记忆投毒**：抽取器吃组装全文（含引用），把**别人**在引用里的话记成该用户的长期事实（海外/留学自述整段入库） | `engine.run` → `facts.extract` | ✅ 新增 `extraction_text` 参数，抽取只吃 `merge_user_texts`（用户本人消息）；召回仍用全文（读路径不产生记忆） |
-| **M** | **角色名泄漏闭环**：抽取 prompt 自称「记忆抽取器」→ 该词随元语句存入 facts → 同轮先存后召回，立刻进 system prompt → 主模型自称"记忆抽取器" | `facts.EXTRACT_PROMPT` / `engine` M4 段 | ✅ prompt 改为"后台长期记忆标注程序（不是对话参与者）"并新增元语句禁令；`is_transient_fact` 补 `_META_PATTERNS` 代码级兜底；污染 facts 已清理 |
+18 个生产 env 键不在 `settings_spec.ENV_SPECS`；spec default 与代码 default 三处漂移
+（`LLM_MODEL` spec `step-3.7-flash` vs 代码 `step-1-flash`；`AGENT_WAKE_WORDS` spec `小助手,助手`
+vs 代码 `''`）；`find_env_names` 漏 `env_bool` 包装的 6 个键。本轮已把 6 处 `kind=bool` 手解
+迁到 `boolenv`（脏值告警后回落默认），但 schema 漂移本身未动。
 
-**遗留（未改，记录在案）**：`engine` 仍是"先存后召回"——当轮写入的幻觉事实当轮
-即可被召回（本次"记忆抽取器"身份错乱的放大器）。改为"先召回后写入"会改变既有
-语义（M4 注释表明原顺序系刻意保留），需单独立项评审。
+### 7.7 并发生命周期（上一轮 C 组，仍未修）
 
-**数据清理记录**：session 69 的 12 条污染 facts（id 236–247，含 11 条引用投毒 +
-1 条角色名元语句）已删除；备份在 `data/backups/facts-cleanup-session69-20260928.json`。
-清理脚本首次误删了同 session 7 条正常旧记忆（id 22/59/60/77–80），已从备份原样恢复
-（文本/来源/created_at 不变，embedding 因备份未含向量而由 `EmbeddingClient` 重新生成——
-与"换向量模型后旧向量失真"同理，短期召回质量可能略降，属已知代价）。
+cron tick 串行致触发时刻漂移；`growth.aclose`/`debounce.cancel_all` 零调用方（前者本轮 E4 已接线到
+`lifecycle.shutdown_agent`，后者仍为死代码）；预算硬闸四种日志待遇（`engine.py:1068/1383/1740/1800`）；
+`engine.py:1284` 的 `gather` 无 `return_exceptions`。
 
-**回归用例**（均已做"改坏实现→必须失败"变异复核）：`test_pipeline.py::TestAtSegmentRendering`
-/`TestQuotedSenderAttribution`/`TestMergeUserTexts`、`test_engine.py::TestExtractionScope`、
-`test_facts.py::TestMetaFactFilter`。
-
-### 6.4 线上事故：私聊 /reboot 不重启（2026-09-30，已修）
-
-| 项 | 内容 |
-|---|---|
-| 现象 | 私聊发 `/reboot`，bot 不重启，反而由 LLM 作答「云崽没有重启键」（`data/logs/agent.log` 06:30）；此前 02:15 试 web 重启按钮返回 404 |
-| 根因 1（代码） | `plugins/qq_agent_adapter/__init__.py` 的 `_load_plugin_modules()` 从未 import `.reboot`——reboot.py 的 `on_command` 是**模块级注册**，模块不进 sys.modules 就没有响应器；`8575d6a` 提交时只补了 web handler 内的懒 import，漏了命令面接线。消息于是落给 priority=10 的聊天响应器（LLM） |
-| 根因 2（时序） | 事故进程 02:20:44 启动（systemd `ActiveEnterTimestamp`），而 reboot.py 02:37:30 才提交——鸡生蛋：/reboot 要用得先重启，重启原先没有可用入口 |
-| 佐证 | `pkgutil.iter_modules(["plugins"])` 只发现顶层包（nonebot 不递归子模块）；模拟 `_load_plugin_modules()` 后 `TrieRule.prefix` 有 `/push` `/reset` 等而**没有** `/reboot` |
-| 修复 | `_load_plugin_modules()` 补 `.reboot` import（try 隔离，与 poke 同口径：装载失败只降级该功能，web 重启的 handler 懒 import 仍可用）；`reboot_route` 全局句柄 |
-| 回归 | `tests/test_reboot.py::TestRebootMatcherWiring` 3 条（子进程隔离跑生产加载路径：加载器接线 / trie 注册 / `handle_event` 端到端路由）。变异复核 3/3——删掉接线三条全红 |
-| 教训 | 「模块级 on_command + 动态 import 加载」的接线没有测试锁过：旧测试只调 handler，从不验证**响应器真的注册**。新模块带 matcher 时必须同时锁注册与路由 |
-
-### 6.5 线上事故：改 `.env` + `/reboot` 不生效，新白名单群戳一戳无响应（2026-10-12，已修）
-
-| 项 | 内容 |
-|---|---|
-| 现象 | `.env` 的 `ALLOWED_GROUPS` 加入新群 `2000000006` 后发 `/reboot`（strategy=execv），同群聊天一切正常，但戳一戳毫无反应——无回复、无 `[poke]` 日志、连冷却/未授权提示都没有 |
-| 根因 | `bot.py` 的 `load_dotenv()` 是 override=False，旧进程早已把旧 `.env` 注入 `os.environ`；`reboot.py` 的 `os.execv` 用**当前** environ 自替换，旧值被原样带给新进程，新进程的 load_dotenv 对已存在的键不覆盖 → 运行中的 `ALLOWED_GROUPS` 停留在旧的 5 群。戳一戳走 `is_strict_allowed`（superuser 之外还要求群在白名单——它回的是整机概览图）→ 静默 return（仅 DEBUG 日志）；聊天走 `is_allowed` 对 superuser 无条件放行，所以故障只体现在戳一戳上 |
-| 佐证 | `/proc/<pid>/environ` 实测 `ALLOWED_GROUPS` 5 群 vs 磁盘 `.env` 6 群（mtime 03:14:36）；journal 时间线：03:14:48 `/reboot`（execv）→ 03:17:04 戳 2000000006 无 `[poke]` 日志 → 03:18:00 戳 2000000002 正常回图 68489 bytes；拿进程实际环境跑 `is_strict_allowed`：2000000006=False / 2000000002=True；`load_dotenv`+execv 行为复现：execv 重启后新进程读到的仍是旧值 |
-| 修复 | 新增 `agentcore/env_snapshot.py`：`prime()` 把「抓出生环境快照 → load_dotenv」的顺序写死在一起（bot.py 启动调用一次）；`reboot.py` 的 re-exec 改用 `os.execve` 只带出生快照（无快照时退化为原 `os.execv`）——`.env` 派生值全部丢弃、由新进程从文件重读。优先级模型不变：真实环境变量（systemd/shell 导出）本就在快照里且 load_dotenv 不会覆盖它 |
-| 回归 | `tests/test_env_snapshot.py` 5 条（prime 顺序不变量 / override=False 语义 / 幂等 / 返回副本）+ `tests/test_reboot.py::TestReExecPristineEnv` 4 条（旧值不传给新进程 / 出生环境变量原样保留 / 无快照退化 execv / 端到端读到新 `.env`）。变异复核 3/3：execve 改传当前 environ、`env` 恒 None、prime 顺序反转分别 2/3/1 条必失败 |
-| 教训 | ①「注入型配置 + 继承 environ 的进程自替换」是隐性组合：重启要等价于全新启动，environ 必须先回出生状态、再让新进程重读文件；②静默 fail-closed 的 ACL（未授权只记 DEBUG）会把「配置没生效」伪装成「功能坏了」，诊断成本极高——同日定夺：未授权改 **WARNING 留痕（含会话键）**，不回话的静默不变（回归：`test_poke.py::TestAcl::test_unauthorized_is_silent_but_warns`，主人会直接查日志或让 bot log_tail）；③「`/reboot` 与 `systemctl restart` 不等价」这件事 README/AGENTS.md 此前都没写，现已在两处补明 |
-
-### 6.6 REVIEW-1e0f5ae..a0a6bb4 修复记录（2026-10-12，同日修复）
-
-双 H（tar 超限放行、PIL 渲染阻塞事件循环）+ M×10 + L 必修 8 条全修，逐条修复方式、回归与 14 处变异复核见
-[`review/FIX-1e0f5ae..a0a6bb4.md`](review/FIX-1e0f5ae..a0a6bb4.md)。两条行为变更在此入档：
-
-| 项 | 变更 | 理由 |
-|---|---|---|
-| 群统计采集/原文归档白名单空集语义（M1） | 「空集 = 全采集」→「**空集 = 不采集/不归档**」（fail-closed），与 `ALLOWED_GROUPS` 在聊天面的 acl 语义对齐；开关开而白名单空时启动打 WARNING | 076613e 的 README 声称「仅白名单群」，旧实现空集放行等于静默落库所有群消息（含原文），隐私口径不能 fail-open |
-| 容器备份 pg_dump 注入形态（M7） | `docker exec -e PGPASSWORD=…`（密码进 argv）→ `docker exec -i <c> sh -s` + stdin 脚本注入（密码不进 argv，参数整段进脚本） | 密码驻留宿主机 `/proc/<pid>/cmdline` 对同机其他本地用户可读；restore（psql）路径 stdin 被恢复 SQL 占用，stdin 注入不可行，**有意豁免**保留 `-e` 形态并已在 `db_backup.py::_with_container_env` docstring 入档，勿「顺手统一」 |
-
-显式遗留 L（依 REVIEW-WORKFLOW §3 L 级收敛规则登记，下轮复核）：L4/L5（围栏名单扩容与 re-exec 入口 env，需管理员决策）、L12（文案口径，产品决策）、L14/L15（性能/断言打磨）、L16/L17/L19/L21（wiki 工具链）、L23（部署语义）、L25–L28（工具链打磨）。
-
-### 6.7 线上事故：闲置 5 天的会话历史被当成"刚才"，回复援引古早话题（2026-10-13，已修）
-
-| 项 | 内容 |
-|---|---|
-| 现象 | 群 `2000000001`，07:53:48 用户（QQ 1000000001）只发了"这是什么"+ 一张超识图预算被跳过的图（引用的是别人发的表情）。bot 回复"图片太大…不过结合**你刚才在聊 265K + Z890 + 缩缸** 的话题，盲猜你发的可能是 CPU-Z 截图…**刚才说的** PCIe/电压/频率设置"——而该话题是 **5 天前（10-08 02:11–02:24）** 的对话 |
-| 根因 | 会话历史的取数窗口只有**条数**（`summary_fetch_limit=200`）与**预算**（`history_token_budget=3000`）两个维度，**没有时间维度**：`get_history_window` 不带时间戳，`_project_history` 也不发。该会话（`g:2000000001:1000000001` → session 71）自 10-08 02:24 起闲置 **125.5 小时**，07:53 那轮 prompt 里的历史正是 10-08 的 4 个来回（id 1599/1600/1605/1606/1607/1608，2570 token = 预算的 86%），紧贴着当前消息——模型看不到任何时间戳，只按消息相邻性把它当成"刚才"发生的事。图片被跳过（零视觉信息）只是放大了这个误判 |
-| 佐证 | 用引擎真实函数对库内 session 71 的消息复算：kept = [1599,1600,1605,1606,1607,1608]；当前用户消息（id 1733）全文只有引用表情 + "这是什么" + `[图片1 超出识图大小预算，已跳过]`；排除其它来源：`facts` 表无 265K/Z890/缩缸 相关事实（该用户 114 条全是鸣潮角色/八字类）、`persona_growth` 只提"聊过硬件"、KB 检索 top4（相似度 0.59~0.61）全是原神/阴阳师语录、缩缸块（chunk 137584）未进 top4 |
-| 附带缺陷（同轮查出，已修） | **滚动摘要静默停更**：`summary_max_tokens=400` 对推理型模型（step-3.7-flash）太小——实调 API 返回空 content + `finish_reason=length`，`_summarize_messages` 静默返回 `(None, None)`：水位永不推进、旧摘要持续注入、日志零记录。session 71 的摘要从 09-30 起卡死在水位 1379、内容只剩 27 字垃圾（`**AMD RX 9070 GRE 核心参数：**\n-`），全表 30 个会话水位全部落后（session 73：1147 vs 1732）。水位 1379→窗口 1599 之间的 21 条消息既不在历史也没进摘要，静默丢失 |
-| 修复 | ① `get_history_window` 双实现带出内部 `ts`（InMemory `time.time()` / PG `created_at.timestamp()`，与 `id` 一样不进最终 messages）；② 新增 `agent.history_stale_after`（默认 21600 秒，0=关闭）：保留窗口最后一条距今超阈值时，system prompt 注入「对话时间线」警示——明说上下文发生在多久以前（"5 天前（10-08 02:24）"）+ "除非用户明确在继续旧话题，不要把历史内容当作刚刚发生的上下文来引用，也不要用它猜测当前消息的指代"。历史**不丢弃**（用户说"接着上面说"时信息仍在）；③ `summary_max_tokens` 默认 400 → **4096**（与 `distill_max_tokens` 同源教训：推理型模型会把输出预算耗在思维链上），空正文分支补 **WARNING 留痕**（finish_reason + max_tokens） |
-| 回归 | `tests/test_engine.py::TestStaleHistoryTimeline` 5 条（超阈值注入警示含距今天数/新鲜不注入/阈值 0 关闭/无 ts 不猜/空历史不炸）+ `TestRollingSummary::test_empty_summary_text_warns_and_keeps_watermark` 1 条（WARNING + 水位不动 + 不伤当轮回复）+ `test_sent_history_has_no_internal_fields` 增加 `ts` 不得外发断言 + `tests/test_store_contract.py::test_history_window_contract` 增加 ts 契约断言（双实现）。**变异复核 5/5**：警示恒不注入 / 去掉阈值 0 关闭路径 / 空摘要静默 / ts 外发 / InMemory 不返回 ts 分别被对应用例抓住，还原后全量复跑 |
-| 验收 | 默认套件 `pytest -q`：**2375 通过 + 58 跳过**；带 `TEST_DATABASE_URL` 全量：**2443 通过 + 9 跳过**（PG 契约子集 45 通过）；ruff check + format --check 全绿（0.9.6） |
-| 教训 | ①「最近 N 条」≠「最近的语境」：只有条数/预算维度的历史窗口，会把闲置数天的旧轮次无缝拼到当前消息前，模型必然误判时间关系——**持久会话上下文必须带时间维度**；②推理型模型的输出上限不能按"摘要几百字"给（distill 侧早有注释，summary 侧漏改），且**空返回必须留痕**，否则"静默停更"能伪装成"功能正常"数周；③识图预算跳过图片时，模型只能拿上下文做模式匹配，陈旧上下文的危害被放大——这两处风险是同源的 |
-
-### 6.8 人格权重被成长层稀释：注入位置降级为数据块 + 提议 prompt 禁降格描述（2026-10-15，已改）
-
-| 项 | 内容 |
-|---|---|
-| 现象 | 管理员反馈「因为成长导致原本的人格权重有些降低」——`yun` 人格的语气/个性表现变弱 |
-| 根因 | 成长层原本**紧贴人格段之后**注入（`engine.py` 的 `_build_system_prompt`），而它框定的职责是「仅用于调整语气与相处方式」，与人格段**完全重叠**；人格 md 是叙事型长文（`yun.md` 1516 字），成长层是指令密度更高的短文本（≤500 字），近因叠加下后者在"怎么说话"这件事上更容易赢。而回顾 prompt 默认就会提炼出「相处从客气变随意」这类**降格**文本，直接对冲人格的「有态度/小毒舌/不是应声虫」。且当时只有 `AGENT_PERSONA_GROWTH_INTERVAL` 一个旋钮，`max_growth_chars` 写死 500——除了整体关闭没有任何调温手段 |
-| 改动（从 X 改为 Y） | ① **注入位置**：成长层从「人格段之后」改为「facts / 知识库等用户派生数据之后」，从第二份人格指令**降级为数据块**；② **人格段**：新增主权声明「以上性格特征是人格的主干：后续任何关于用户关系、共同经历或相处方式的描述，都不得覆盖、弱化或替换它们」；③ **成长层框架句**：从「仅用于调整语气与相处方式」改为「称呼偏好与共同经历，仅用于补充相处细节；它不改变你的人格、性格与语气特征，与人格设定冲突时以人格设定为准」；④ **收尾回锚**：原回锚句只覆盖工作流，成长层之后新增「以上工作流、长期记忆与关系成长记录都不改变人格设定」；⑤ **提议 prompt**（`_REVIEW_SYSTEM`）：删掉「相处模式的变化」这一提炼项，新增禁降格硬约束（点名「更随意/不用敬语/更亲近/变温柔了」）；⑥ **合并 prompt**（`_MERGE_SYSTEM`）：新增「若新进展与助手既有人格特征相冲突，丢弃新进展」 |
-| 新增旋钮 | `AGENT_PERSONA_GROWTH_MAX_CHARS`（默认 500，< 50 由 `GrowthManager` 构造层 `max(50,...)` 兜底）——与人格段争"怎么说话"的唯一调温手段，调小直接降低成长层的覆盖面积 |
-| 存量数据蒸馏（2026-10-15 22:39 已执行） | 改注入逻辑只能防**新**文本，库里 2 条旧记录仍含降格描述。按新约束用 LLM 重写（删"描述助手自身语气/风格变化"的句子，保留称呼偏好与共同经历）：`1000000001` 500→**315 字**、`1000000003` 148→**67 字**。执行前全量备份到 `data/backups/persona_growth-20261015-223903.jsonl`（需回滚时手工 UPDATE 还原）；写入侧同样过 `neutralize_fence_lookalikes` 并截断到 500 |
-| 新增命令 | `/growth [QQ]` 查看成长层原文、`/growth clear [QQ]` 清空（均仅 SUPERUSERS）——此前 `/reset` 只清消息不动 `user_state.persona_growth`，要清它只能手工连库写 SQL。清空前回显原文前 200 字；对无记录用户幂等提示、不谎报成功；轮数计数不重置（清的是文本不是相处历史） |
-| 回归 | `tests/test_persona_growth.py` 新增 `TestGrowthDoesNotDilutePersona`（6 条：位置必须排在 facts 之后 / 人格段主权声明 / 成长层框架让人格 / 段后回锚 / 无成长层不出回锚 / 无人格无成长层措辞）+ `TestReviewPromptForbidsPersonaDilution`（5 条：删掉相处模式项 / 禁词清单 / 范围收窄 / 合并丢弃冲突 / 约束真的到达 LLM 调用）+ `TestGrowthMaxCharsClamp`（2 条构造层兜底）；`tests/test_store_contract.py` 成长层契约补 `clear_persona_growth` 双实现一致性 4 断言；`tests/test_admin_import.py` 新增 `TestGrowthCmdRule`（14 条：6 种合法形态 / 8 种非法形态含全角数字与过短过长 QQ / 权限门 / self 过滤挂在 rule 上）+ `TestGrowthCmdHandler`（6 条：清空/查看 × 有/无记录 × 显式 QQ + 存储失败只回一句）+ `TestGrowthMaxCharsSemantics`（4 条 env 解析）。**变异复核 4/4**：成长层移回 facts 之前 / 删掉「以人格设定为准」/ 删掉禁降格约束 / 把 finish 圈回 try 内（重犯 §5 老坑，实测管理员会收到「已清空…」+「操作失败」两条矛盾回复）分别被对应用例抓住，还原后与备份逐字节一致 |
-| 验收 | 默认套件 `pytest -q`：**2447 通过 + 58 跳过**；**带 PG 全量套件：2515 通过 + 9 跳过**（PG 用例全部跑起，比默认多 68 个）；ruff check + format --check 全绿。**PG 双实现已验证（2026-10-15）**：`tests/test_store_contract.py` 在 `qqagent_test` 与全新空库上各 **36 passed**（含 `test_persona_growth_contract[pg]`，`clear_persona_growth` 的 4 条契约断言）；变异复核追加 1 项——去掉 PG 侧 `WHERE persona_growth IS NOT NULL` 后仅 `[pg]` 红、`[memory]` 仍绿，证明契约真的锁死了双实现一致（而非恒真断言）。测试库已重建为严格 CI 等价的空库，三个手工 scratch 库（`qqagent_scratch_contract`/`agent_demo_pgtest`/`qqagent_freshtest`）已清理，测试库策略写入 AGENTS.md §3 |
-| 教训 | ①**同一职责域的两段文本挨着放，短的那段赢**：人格 md 靠叙事与细节立人设，关系成长靠密指令说话，把后者放在前者正后方等于让它覆盖前者——"分层注入"不等于"平级注入"，派生数据必须放在结构上更低的位置；②生成侧的约束要和注入侧的约束**同时**收，只改注入框架不改生产 prompt，LLM 仍会持续产出降格文本；③只有一个开关（整体开/关）的功能不配谈"调优"，阈值类旋钮至少要暴露上限 |
-| 追加整改（2026-10-15 23:00，回应"会不会随时间变臃肿"） | ①**截断改句子边界**：旧实现两处裸切片（`proposal[:300]` 与 `merged[:500]`），LLM 不守字数时会把最后一句话切成半句（实测落库 500 字、末尾「…第19句话」）。新增 `_clip_at_sentence`：只在 `[limit*0.7, limit]` 区间内找最靠后句终符，标点稀疏时退化为硬截断——否则两段式记录会被整段砍掉（实测把 limit 前唯一的换行符当边界，500 字记录只剩 5 字）。`_propose` 的提议截断是同款缺陷的另一个入口，由端到端用例抓住；②**合并 prompt 给出写入优先级**：旧措辞「保留仍然有效的…去掉过时或重复的」是空话，LLM 保守偏差下倾向全留 → 500 字额度被最旧话题占据。改为「称呼偏好 > 最近进展 > 较早话题，字数不够主动删最旧的」；③**字数曲线日志**：`persona growth merged: user=%s chars=%d (old=%d proposal=%d cap=%d)`，配合 `/growth` 区分"该调温"与"该清理"。**长度不会膨胀**（两道截断封顶，实测第 2 次确认即到顶、12 轮模拟无增长）；会恶化的是语义信噪比，这是当前已知的残留取舍 |
-
-### 6.9 解压白名单展平 flag 击穿条目表执行位清理 + 评审 L 批修（2026-10-15，已修）
-
-| 项 | 内容 |
-|---|---|
-| 来源 | [REVIEW-a0a6bb4..6745556.md](review/REVIEW-a0a6bb4..6745556.md) H1（线1 子代理发现、主代理实包复现）+ L 批量关闭计划（必修 12 条） |
-| 现象 | `tar --strip-components=1` / `unzip -j`（均在白名单内）把 `pad1/pad2/evil.sh` 展平落成 `out/evil.sh`，`strip_entry_exec_bits` 按扫描期条目名找不到文件——实包复现 0755/0777 存活（对照组 0644/0666 清理正常），重组「压缩包→解压→run_build_script（继承完整环境）」链（勘误 L10，2026-10-18：原文「curl 拉包」失实——curl 白名单 GET-only 无落盘通路，落盘实际靠 fs_write 构造压缩包）。涉事 flag 为既有白名单成员：上轮 H1 修复（扫描超限即拒）未覆盖此门 |
-| 修复（H1） | 两 flag 移出白名单（解压前拒绝；非必需能力）；runner 模块 docstring/注释同步移除原因；L13 不可达防御分支文案不再渲染「-1 个」 |
-| 回归（H1） | `tests/test_runner_security.py::TestH1FlattenFlagsRefused`：4 形态 permitted 负例 + tar/unzip 端到端「拒绝且零落盘」2 条 + 2 处白名单正向断言翻负；**变异复核：flag 加回白名单 → 6/6 红**；评审报告 §1 复现脚本翻转验收（0755/0777 → 解压前拒绝、零落盘） |
-| 同批 L 必修（12） | L1 jieba 预热任务强引用（`_BACKGROUND_TASKS`，仿 growth._spawn/debounce 纪律）；L2 runner 注释「告警放行」→「即拒」；L7 stale 跨时钟源注记 + 契约不断言 ts 单调（部署假设不入契约）；L8 low 档启动日志后缀改「仅只读三件，控制类未注册」；L9 启动日志清单守卫测试（`TestStartupLogListGuard`，变异 1/1 抓死）；L10 conftest 夹具序 load_dotenv→guard→strip（.env 来源 DATABASE_URL 的防误连比对真正生效）+ 剥离夹具 docstring 修正；L11 行数快照实测更新；L12 双重装饰器删除；L13 防御分支文案；L14 `_pair_sim` docstring 如实化（仅内存侧锁定、与 PG NaN 口径有意分歧）+ PG score 注释；L15 kb_search sources 快照化 `dict()` + 注释如实；L16 embed 失败路径代价注记 |
-| 遗留（4，理由入档） | L3 `_CONTAINER_RE` 首字符 `-`（行为无害，随下次 runner/skills 触碰收紧）；L4 `growth.aclose` 无调用方（停机接线属 lifecycle 语义决策）；L5 self 引用标注兜底路径缺失（需 resolve_quoted_media 扩展返回 sender，跨模块接口）；L6 raw-dump 全文落日志（调试开关限长属管理员可视性取舍）——明细见 [FIX-a0a6bb4..6745556.md](review/FIX-a0a6bb4..6745556.md) |
-| 验收 | 默认套件 **2454 通过 + 58 跳过**；带 PG 全量 **2522 通过 + 9 跳过**（`qqagent_test`，无 DDL 变更未重建）；ruff check + format 双绿（0.9.6）；复现翻转：两攻击面均「解压前拒绝、零落盘」 |
-
-### 6.10 解压线整体退役外部 zip/unzip/tar（方案 B）+ registry.execute `name` 形参冲突（2026-10-18，已修）
-
-| 项 | 内容 |
-|---|---|
-| 来源 | [REVIEW-6745556..d730827.md](review/REVIEW-6745556..d730827.md) H1（主代理亲复现：unzip 通配符 archive 名 → `_zip_scan` 空转 `(None,[])` → 条目表全部防线失效、`evil.sh` 0777 落盘）+ 实施中新发现（registry name 冲突）。修复见 [FIX-6745556..d730827.md](review/FIX-6745556..d730827.md) |
-| 定性 | 本轮 H1 与上轮 H1（6.9）同型：都是「Python 预扫描 vs 外部解压工具真实行为」语义鸿沟的新门。加上更早的 zip `-T/-TT` 与扫描超限「告警放行」，**历轮 4 个 H 全部出生在这条缝里**——继续封 flag 是打地鼠，管理员拍板方案 B：消洞而非堵洞 |
-| 修复（H1） | 外部 zip/unzip/tar 整体退出 `run_command` 白名单（任何参数形态拒绝）；新增 `agentcore/skills/archive_skills.py`：`extract`（zip/tar 系解压，**两遍法**零落盘拒绝、产物一律 0600/0700、拒穿越/绝对路径/`.git*`/链接/设备条目、条目数与总大小上限防炸弹、输出过围栏）与 `pack_zip`（打包，拒 symlink、条目 0600）；runner 删除解压军备全套死代码（约 500 行）；接线与启动日志、`.env.example`（`AGENT_EXTRACT_MAX_ENTRIES`/`AGENT_EXTRACT_MAX_MB`）、docs/features-skills.md（新「压缩与解压」节）、AGENTS.md §4 同步。「LLM 内容→可执行文件」的转化通路自此不存在（fs.write 0600 + extract 0600 双侧） |
-| 修复（M，新发现） | `SkillRegistry.execute` 的 `name` 形参与技能参数 `name`（run_build_script/pack_zip）冲突：engine `**func_args` 透传 → 函数绑定期 TypeError，handler 内 try 兜不住 → **run_build_script 自上线起在真实链路永远执行失败**，直调 handler 的测试全绿故未暴露。修法：`name` 改 positional-only（`/`）一行；回归 `test_registry_execute_with_name_kwarg` 走 registry 端到端（修复前必红）；AGENTS.md §4 增补纪律 |
-| 回归 | 新增 `tests/test_archive_skills.py` 30 例（含 4 种 tar 压缩格式、两遍法零落盘断言、0600/0700、双上限、白名单退役负例 `TestCompressionToolsRemoved`）；test_runner_security 删除 8 个已退役防线的用例类；worktree 变异复核 3/3 被抓（0600→0644：5 红；删 `..` 检查：3 红；删条目上限：1 红） |
-| 遗留 | 评审报告的 M×5（skills symlink 旁路、`.env.example` npm 活值、skill done 前缀误判、`total` 起点、MAX_WAIT WARNING 文档漂移）与 L×15 待管理员定夺后修复（L10 措辞已随本批文档部分收敛） |
-| 验收 | 默认套件 **2478 通过 + 58 跳过**；带 PG 全量 **2546 通过 + 9 跳过**（`qqagent_test`）；ruff check + format 双绿（0.9.6） |
-
-### 6.11 线上事故：一条含 NUL 的群名片毒化全部群统计 flush 95 分钟（2026-10-20，已修）
-
-| 项 | 内容 |
-|---|---|
-| 现象 | `data/logs/agent.log` 15:18:34–16:53:34 出现 **191 条同源 ERROR**（每 30s 一条、无一成功）：`群统计 flush 失败，已合并回内存等下一批重试` → `asyncpg.exceptions.CharacterNotInRepertoireError: invalid byte sequence for encoding "UTF8": 0x00`。全部 3 个白名单群（2000000003/2000000002/2000000004）的发言统计停写 95 分钟 |
-| 根因 | 群 2000000003 用户 1000000005 的**群名片（`sender.card`，协议端下发、用户可控）含 NUL 字节 0x00**。PG 的 text 列不接受 NUL → `upsert_daily` 的 `executemany` 整批失败 → 事务回滚 → collector 按设计把批次合并回内存 → 30s 后重试又失败……**毒丸效应**：一条脏名片卡死所有群的统计。佐证：`group_msg_daily` 当天所有行名片均干净、该用户无任何行（毒丸行从未落库）；时间线上首次失败前白名单群内仅有的两条消息（15:18:16/15:18:26）均来自该用户。16:53 进程重启后错误暂停（内存批次被清空），但根因未除——该用户再发言即复发 |
-| 为什么没被拦住 | `loop/engine.py` 与 `workspace/fs.py` 都有 `[\x00-\x08\x0e-\x1f\x7f]` 控制字符清洗，但 **groupstats 的落库链路完全没有**：`.strip()` 不剥 NUL、`[:32]` 截断也不剥。分词出的 `word` 与归档表 `raw.py` 的 nickname/text 是同模式未清洗面（当时归档未启用） |
-| 修复 | 落库边界单点清洗：`store.py` 新增 `_CONTROL_RE` + `_clean_text()`（口径与 engine/fs 同款，保留 \t\n\r），`InMemoryStatsStore` 与 `PgStatsStore` 的 `upsert_daily`（nickname）/`upsert_words`（word）**双实现共用**——内存实现先清洗再判空（剥净后为空的名片不覆盖旧值，与 PG 的 `CASE WHEN excluded.nickname <> ''` 同语义，守住双实现一致不变量）；`raw.py` 归档链路 `record()` 入口同步清洗 body/nickname |
-| 回归 | `tests/test_group_stats.py` 新增 4 条：`TestStoreContract` 3 条参数化双跑（名片剥净 / 纯控制字符名片保留旧值 / 词剥净）+ `TestCollector::test_flush_with_nul_nickname_does_not_poison_batch` 端到端（脏名片 + 正常消息同批 → flush 成功、两行都落库、名片剥净）。**变异复核 4/4**：`_clean_text` 改空操作后 4 条全红，还原后复绿 |
-| 验收 | 默认套件 `pytest -q`：**2768 通过 + 58 跳过**；带 `TEST_DATABASE_URL`（`qqagent_test`）全量：**2839 通过 + 9 跳过**（PG 臂含新契约用例，含 NUL 的 upsert 在真实 PG 上通过）；ruff check + format --check 双绿 |
-| 教训 | ①**用户可控字段进 PG 前必须过控制字符清洗**——名片/昵称/正文全部来自协议端，PG text 列不接受 NUL 是硬约束，`strip()`/截断都不防它；②「失败合并回内存重试」的容错设计会把**单行脏数据放大成整功能停摆**（毒丸行永远在批次里，每次重试都全批失败）——批量落库的入口清洗不是优化而是可用性前提；③同一约束（PG 编码限制）要在**所有落库面**统一执行（聚合/词频/归档三处曾各缺一遍），双实现还要同口径否则契约测试锁不住 |
-
-### 6.12 线上事故：自动发文件把「提到文件」误判为索要，正文被替换成「文件已发送」（2026-10-22，已修）
-
-| 项 | 内容 |
-|---|---|
-| 现象 | 管理员私聊（`private:1000000001`）连续两轮正文被吞：①00:55:40 用户发 786 字事故响应题（其中陈述句「公司的软件和**外发机密文件**通过 emSign 代码签名」）→ 00:55:55 模型生成 841 字回复 → 00:55:56 `[auto_file] FILE_OK: 文件 report.md` → 用户只看到「文件已发送」；②01:01:12 用户抱怨「这个字又不多，你为什么发个**文件**给我，我还得打开」→ 01:01:18 模型已答「行吧，图省事翻车了。要的话我直接贴出来，**不折腾文件了**」→ 01:01:19 兜底再次发出同一份 `report.md`，回复又被替换成「文件已发送」 |
-| 根因 | `matcher._user_asked_for_file` 是**裸关键词包含**：`any(k in text for k in ["文件","文档","md文档","markdown",...])`。只要用户文本出现「文件/文档」就触发，完全不区分陈述、抱怨与索要；且该兜底在引擎返回后执行，会覆盖模型自己「不发文件」的决定 |
-| 修复 | 改为**否定/抱怨优先 + 明确请求句式**：`_FILE_REQUEST_NEGATIONS`（别发/不要发/为什么发/又发/还得打开…）命中即返回 False；否则要求请求动词（发我 / 发个 / 发一份 / 给我发 / 传我 / 导出 / 整理成 / 打包成）与「文件 / 文档 / markdown」在限定距离内同现，或「文件…发我/给我/传我」。同步更新 `docs/features-messaging.md` 的「主动发文件（正向条件）」 |
-| 回归 | `tests/test_pipeline.py::TestUserAskedForFile` 新增 3 条：两条线上原句（抱怨句/陈述句）断言不触发，一条正向（发一份文档 / 整理成 md 文档发我 / 导出成文件）保活。**变异复核 2/2**：把实现临时改回裸关键词包含，两条负向用例全红，还原后复绿 |
-| 验收 | 默认套件 `pytest -q`：**2831 通过 + 60 跳过**（新增 3 条后实测）；`tests/test_pipeline.py` 单文件 134 通过；ruff check + format --check 双绿 |
-| 教训 | ①**启发式兜底只看名词必然误伤**——触发条件要锚定「祈使意图」，并把否定/抱怨语境优先判出；②兜底逻辑运行在模型之后时，不能无条件推翻模型已经表达的「不发文件」决定，触发判据应只看用户输入（本次已收紧）；③排障缺口：`[msg]` 只记 `text`，私聊空文本/表情/文件段类型在日志里不可见，定位「用户到底发了什么」只能查库 |
-
-### 6.13 自动发文件：删除关键词/LLM 兜底，改由 LLM 自主调 `send_markdown_file`（2026-10-22）
-
-| 项 | 内容 |
-|---|---|
-| 动机 | §6.12 用「否定/抱怨优先 + 请求句式正则」修关键词误发，但仍是字符串匹配、治标；且兜底运行在引擎返回后，会用字面**覆盖模型自己的决定**（模型已答「不折腾文件了」仍被补发）。要根治就得让「要不要发文件」回到 LLM 语义判断 |
-| 方案 | **删除 matcher 的文件兜底**（`_run_and_format` 里按用户文本关键词/LLM 判断后强制发文件并替换回复的整段逻辑），不再有事后兜底。发文件完全由 LLM 自主决定：用户说「把…以文件发我」「发我…文件/文档/md」时，LLM 按语义调用既有的 `send_markdown_file` skill（system prompt 工作流第 3 条已引导，skill 对 LLM 可见）。**与系统级 1500 字门禁（`outbound.deliver_reply`）互相独立**：门禁按长度自动发文件，本条按用户意图由 LLM 触发；1500 字门禁不改动 |
-| 为何足够 | 两次误发的根因是**兜底强制覆盖**——它只看字面、不看语义，也无视模型已表达的「不发」。删掉兜底后，陈述句（「外发机密文件…」）与抱怨（「你为什么发个文件给我」）LLM 都不会当成索要，自然不调 `send_markdown_file`；真要文件时 LLM 才调 |
-| 回归 | 删除 `_user_asked_for_file`/`_maybe_file_request` 及对应测试（`TestUserAskedForFile`/`TestMaybeFileRequest`）；`test_quoted_content_cannot_trigger_auto_file` 更名为 `test_quoted_content_excluded_from_user_text`，只保留「被引用内容不进 `user_text`」这一 M5 边界断言（该边界仍服务于记忆抽取只吃用户本人文本） |
-| 验收 | 默认套件 `pytest -q` 全绿（具体数见头部 DOCS-STATS 机器生成块）；`tests/test_pipeline.py` + `tests/test_file_sender.py` 159 通过；ruff check + format --check 双绿；全仓无 `should_send_file`/`_maybe_file_request`/`auto_file` 等兜底残留引用 |
-| 教训 | ①「要不要做某件事」的**元决策**应交给 LLM 语义判断，而不是维护关键词/正则兜底——后者对新表达必然漏，且运行在模型之后会用字面覆盖模型的明确意图；②系统级门禁（按长度）与用户意图触发（按语义）是两条独立路径，别用一条去补另一条 |
-
-### 6.14 REVIEW-1b16fa7..9c2d3c1 全量修复：4H / 19M / 18L（2026-10-23）
-
-| 项 | 内容 |
-|---|---|
-| 范围 | `review/REVIEW-1b16fa7..9c2d3c1.md`（5 线并行 + 主代理实证：双套件实跑、4 个 H 全部亲自复现或读码证实、变异 worktree 抽查）；修复记录 `review/FIX-1b16fa7..9c2d3c1.md` |
-| H1 恢复过滤误删数据行 | `_feed_restore_stdin` 改 COPY 块状态机：块内一行不滤、块外仅删顶格 `^SET transaction_timeout`（旧按子串滤会删掉字段内容含该词的 COPY 数据行，且 `\.` 完好、psql 不报错——恢复「成功」但静默丢数据）。反向用例 + 变异复核 |
-| H2 preview 明文回显凭据 | `settings/preview` 与写第一段对 `secret=True` 键只回 `is_set` 布尔；`cw.masked(value, secret=)` secret 一律 `***`（旧口径只认 `sk-` 前缀，URL 类凭据原样漏出；preview 是零 2FA 的只读路由）。两条 TestClient 回归 + 变异复核 |
-| H3 LLM_MODEL 预探测免 2FA 外带 | 探测移到 `_consume_confirm` **之后**，失败时**退还 nonce**（管理员改名可直接重试——原「码还有效」诉求以退还确认凭证实现）；`probe_failure_detail` 对齐 llm 侧口径只回状态码（连带收口上轮 L5 的 body 回显）。两条回归 + 变异复核 |
-| H4 2FA 可在线爆破 | challenge 的 HMAC 加入时间戳段（30s 时效，随 token 本体传输）+ 同源 IP 15 分钟 5 次失败锁定 + 成功清零；nonce 失败路径不消费（管理员手滑输错码不必重走两段，爆破面由计数兜底：5 次/15 分钟/IP × 3 有效码/10⁶ ≈ 期望百年量级）。两条回归 + 变异复核 |
-| M 批（19 条） | `/2fa` 限私聊；「校验」2FA 文档口径勘误；搜索 `search_multi` 残留 env 判空改 providers 判空；test 连接只回状态码；「改后重启生效」勘误为热生效；200+错误体触发 fallback（三源 schema 校验）；多源总墙钟 `AGENT_SEARCH_TOTAL_TIMEOUT_S`（默认 25）；损坏回落 env 面板标 degraded；U 盘 `mountpoint -q` 挂载判定；远端命令拼接防护（KEEP_DAYS 数字校验 / MIRROR_ROOT 拒单引号 / `ssh --`）；VPS `REQUIRE_PRIVATE_IP=1`；三个 backup service `UMask=0077` + `OnFailure`；mirror `backups` 缺失 fail-loud；MANIFEST 必含清单硬断言；title 100 字门禁 + 渲染 Semaphore(2)；软上限截断图内标注（`_footer_note`）；`.env.example` 空值键 `or`-回落默认（totp/search/llm 三处路径）+ 非 base32 secret 重生成；CHANGELOG 补录后半批 |
-| L 批（18 条） | 随 H/M 顺带修 8（masked/challenge 假提示/全挂报错脱敏/渲染信号量/stepfun env 层统一/max_results 夹紧/test_totp or 逃逸/NO-SIDECAR 文案区分）；独立小修 6（AGENTS 168 键/docs 措辞/jsonl 口径/OnFailure/确定失败降级用例/gitignore 提示）；显式遗留 4（key 备份目录同源决策、时钟回拨轮转影响极低、PITR 无产出者、`\x0b/\x0c` 全仓四处统一口径需专项） |
-| 上轮遗留 | persona 覆盖备份三重不一致（0644/同秒互覆/无滚动）与 `PersonaManager.save` tmp 0644 窗口**一并修复**（原子 0600 + 唯一名 + 每人格保留 5 份） |
-| 行为变更（有意） | `search_web`/`search_items` 的 `max_results` 由「透传/0 吞默认」统一为夹紧 [1,20]；搜索全挂报错文案只回异常类型名（不再含端点 URL） |
-| 验收 | 默认套件与 PG 全新空库双绿（数见头部 DOCS-STATS）；ruff check + format --check 双绿；`RUN_PERF=1` 9 无劣化；`check_review_docs --check-stats` 通过；脚本回归 11 例（PATH mock ssh/rsync/getent/mountpoint 跑真实脚本）；全部修复项变异复核「改坏必红」 |
-
-### 6.15 主动联系（nudge）加固：17 项实证缺陷（2026-10-24，已修）
-
-来源：主动联系 P1–P3 落地后的专项复查（`feat/proactive-nudge` 合入 `main` 后）。每条都先复现再改，修复规格与证据见 [`review/AC-proactive-nudge.md`](review/AC-proactive-nudge.md) §K。
-
-| 项 | 内容 |
-|---|---|
-| 范围 | `agentcore/scheduler/{nudge,hotspot,events}.py`、`agentcore/memory/store.py`（新增 `schedule_set_enabled`）、`plugins/qq_agent_adapter/{__init__,admin,web}.py`、`docs/features-community.md`、README |
-| H（会让功能失效/行为错乱） | ① 生日扫描 `done_ids` 定义在消息循环内：用户沉默（窗口无新消息）时每天首个 tick `UnboundLocalError` 且状态不落盘 → 之后每个 tick 都失败；② 爆点/事件也累加 `unanswered` → 2 条新闻后下一条普通变告别、3 条后直接 stopped（无告别）；③ 保护只在生成前判一次 + `_lock` 未使用 → 生成期间用户开口仍发送、`note_user_message` 重置被覆盖、`/nudge run` 与 tick 可双发 |
-| M（逻辑/内容） | ④ 追问永远不可达（触发点用尽即结案；旧用例伪造 `triggers: []` 才绿）；⑤ 一条消息两个事件共用 `e{mid}`，第二件永久丢失；⑥ 事件触发点都在事前却问"进展"（面试前一晚问"面试怎么样"），且 08:30 落在默认静默里实际总被推到 10:00；⑦ `大后天`→`后天`、同句过去标记规则恒失效、`晚上/凌晨12点`→中午；⑧ `quiet_start == quiet_end` 变成全天静默、`next_run` 推 6 天；⑨ 从未私聊过的目标被停用后无恢复路径；⑩ env 开关压着时 `/nudge off` 谎报已关闭；⑪ Web 保存重置 `max_failures` 等三个没上 UI 的键；⑫ 首次 Web 保存 targets 不启用而页面承诺"保存即可启用"（那段提示还被后来的 innerHTML 覆盖，从未显示）；⑬ 热点评分 prompt 未过围栏；⑭ 「主动」页返回用户原话（`events[].quote`） |
-| L（配置/成本） | ⑮ `bool()` 把 `"enabled": "false"` 解析为真；⑯ 热读不带 config.yaml seed（坏文件时启动用 seed、首个 tick 掉回默认）；⑰ 打分 LLM 不过预算闸门、`event_words: []` 回退默认非法 |
-| 行为变更（有意） | 爆点/事件不再推进告别节奏；事件从"用尽触发点即结案"改为"追问一次后结案"；`quiet_start == quiet_end` 表示不静默；显式 `event_words: []` 表示关闭；停用行在目标本人发消息且仍在配置里时恢复 |
-| 顺手修的测试脆弱性 | 用例的 `_at(9,0)` 相对真实时钟可能是未来（凌晨跑测试）：`_prime` 改为抬到 last_user 之后、`_cand` 固定 `found_at`；`test_disabled_service_is_explained` 不再读本机 `data/nudge.json` |
-| 验收 | 默认套件 3072 passed / 63 skipped（2026-10-24 实测）；ruff check + format --check 双绿；新增/修改 16 条守卫逐条"改坏必红"；PG 契约新增 `schedule_set_enabled` 双实现用例（本机无 `TEST_DATABASE_URL`，PG 分支未实跑） |
-
-### 6.16 线上事故：Web 2FA 确认码 30s 窗口短于「私聊取码」往返（2026-10-25，已修）
-
-| 项 | 内容 |
-|---|---|
-| 现象 | 备份页点「下载」→ 填入 2FA 码后报错（`confirm_invalid_or_expired`），下载失败；其他写面操作同样会踩到。修掉过期后变成第二段 200 但浏览器没有任何下载拉起。 |
-| 证据 | ① `data/logs/agent.log`：第一段 POST `/agent-web/api/backup/download` 于 `14:11:58` 返回 200（签发 challenge），第二段提交于 `14:12:33` 返回 **400**，间隔 **35s** > `_WRITE_WINDOW=30`；两者之间无其他 POST（排除 nonce 重放/换值）。② 修复窗口后线上 `14:33:32`/`14:33:35` 两次 POST 均 200，但用户端仍无下载；服务端确在第二段回了 183MB 文件体。 |
-| 根因 | ① challenge 时效 30s 从**第一段响应**开始计时，而用户必须先打开对话框、再去 QQ 私聊 bot 发 `/2fa` 取码、回来填写——这段往返天然超过 30s；TOTP 本身却是 5 分钟滚动码，两个窗口严重错配。② 第二段返回 183MB 文件体，前端用 `fetch → resp.blob() → a.click()`：大文件在手机/内嵌浏览器上会静默失败（Blob 内存/下载策略），且无 try/catch，用户只看到"没反应"。 |
-| 修法 | ① `_WRITE_WINDOW` 30 → 300，与 TOTP 步长对齐；仍保留 HMAC 绑定操作、nonce 单次消费、同源 IP 15 分钟 5 次失败锁定、TOTP 门禁。② 第二段不再回文件体：下发一次性 HttpOnly 票据（90s、单次、绑定文件名与来源 IP），前端用浏览器原生 GET `…/api/backup/download/file` 流式下载；票据不进 URL，GET 复核 CIDR 白名单并在实际传输时记 `backup_download` 审计。 |
-| 回归 | `tests/test_web.py::TestBackupAPI::test_download_accepts_challenge_after_2fa_dm_roundtrip`（模拟取码 4 分钟后提交，改回 30s 必红）、`test_download_two_step_headers_and_body`（票据换文件 + 单次有效）、`test_download_file_requires_valid_ticket`、`test_download_ticket_expires_and_binds_ip`；`test_h4_challenge_expires_after_window` 改为按 `web._WRITE_WINDOW` 取过期样本。 |
-| 文档 | `AGENTS.md` / `docs/features-interaction.md` / `docs/operations.md` / `README.md` 同步下载票据与 5 分钟窗口口径；`CHANGELOG.md` 1.0.3-beta 补修复条目。 |
-
-### 6.17 线上事故：工具循环空转到「想得太久」（2026-10-25，已修）
-
-| 项 | 内容 |
-|---|---|
-| 现象 | 群 `2000000002` 提问「现版本破败王者之剑的主动和被动技能都是什么」；连续 8 个 LLM step 全是 `tool_calls`、无正文，51.78s 后回「这轮想得太久了」。 |
-| 证据 | `data/logs/agent.log`：`21:50:19` 触发 → step 0–7 全部 `content=None` + `tool_calls`；三次 `summarize_url` 均返回 13 字符（与 `抓取失败：HTTP 403` 模板长度一致；日志只记长度，未记正文）；`21:51:14` reply `engine=51.78s / total=55.19s`。 |
-| 根因 | ① `agent.max_iterations=8` 耗尽后直接丢兜底文案，已搜到的素材全部浪费；② 模型换 URL 继续抓 403，签名各不相同，绕过「同签名失败/重复」熔断，`search_web` 换词空转到上限。 |
-| 修法 | ① 步数耗尽后追加一次 `tools=None` 收尾调用：提示模型不要再请求工具、基于已有信息回答；收尾仍空才回原兜底。② 一轮内 `summarize_url`/`fetch_url` 连续失败 3 次 → 停用两个抓取工具 + 注入「用已有搜索结果回答」提示。③ `agent.max_iterations` 移到 Web「模型与 LLM」簇并改名「思考步数」，写入后热更新运行中 engine（`config_yaml.apply_runtime`），不必重启。 |
-| 回归 | `tests/test_engine.py::TestAbortWording`（强制收尾 / 空收尾兜底 / 抓取预算）、`tests/test_config_yaml.py::TestApplyRuntime`、`tests/test_web.py::TestSettingsWrite::test_yaml_write_roundtrip_and_live_label`；三条关键路径均做「改坏必红」复核。 |
-| 文档 | `docs/features-messaging.md`（tool-loop 止损 ④⑤）、`docs/features-interaction.md`（Web 设置生效时机）、`CHANGELOG.md`。 |

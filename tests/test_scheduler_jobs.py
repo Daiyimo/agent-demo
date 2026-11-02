@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from agentcore import boolenv
 from agentcore.scheduler import jobs as J
 from agentcore.scheduler.agent_turn import _NEVER_FIRE, AgentTurnRunner, _next_run_ms
 
@@ -80,6 +81,17 @@ class TestParseJobs:
         assert j.cron == "0 */3 * * *" and j.tz == "Asia/Shanghai"
         assert j.channel == "onebot" and j.to == "group:123"
         assert j.enabled is True and j.delete_after_run is False
+
+    def test_enabled_dirty_value_warns_and_falls_back_to_default(self, caplog):
+        """G（REVIEW 2026-11-02）：jobs.json 是手写主机配置，脏值不得静默按「开」。
+
+        旧手解把 ``"enabled": "disabled"`` 判成 True 且无痕。
+        """
+        boolenv._warned.clear()
+        with caplog.at_level(logging.WARNING, logger="agentcore.boolenv"):
+            jobs, errors = J.parse_jobs({"jobs": [_job_dict(enabled="disabled")]})
+        assert errors == [] and jobs[0].enabled is True
+        assert "不是布尔值" in caplog.text and "disabled" in caplog.text
 
     def test_no_jobs_key_is_empty_not_error(self):
         jobs, errors = J.parse_jobs({"version": 1})

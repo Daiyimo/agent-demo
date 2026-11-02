@@ -409,6 +409,31 @@ class TestPersonaSaveDelete:
         assert "你是温柔的知识伙伴。" in text  # 不写 \u 转义
         assert pm.get("yun").body == "你是温柔的知识伙伴。"
 
+    def test_save_partial_write_logs_warning(self, tmp_path, monkeypatch, caplog):
+        """E3（REVIEW 2026-11-02）：ABOUT.txt 写失败时 SOUL.md 可能已是新版。
+
+        旧实现两文件非事务且无任何日志：web 返回 5xx「保存失败」，但人格
+        已被改一半，用户与运维都不知道。断言：异常照旧抛出（契约不变）
+        且有 WARNING 说明可能不一致。
+        """
+        import logging
+
+        pm = PersonaManager(tmp_path)
+        pm.save("mine", description="旧描述", body="旧正文")
+
+        def boom(path, text):
+            if path.name == "ABOUT.txt":
+                raise OSError("disk full")
+            return None
+
+        monkeypatch.setattr(pm, "_atomic_write", boom)
+        with caplog.at_level(logging.WARNING, logger="agentcore.personas.manager"):
+            with pytest.raises(OSError):
+                pm.save("mine", description="新描述", body="新正文")
+        assert any("部分写入失败" in r.message for r in caplog.records), (
+            "半截写入必须打 WARNING（否则用户看到失败却不知道人格被改一半）"
+        )
+
     def test_delete_removes_and_reports_missing(self, personas_dir):
         pm = PersonaManager(personas_dir)
         pm.save("mine", body="x")
@@ -434,6 +459,71 @@ class TestPersonaSaveDelete:
             with pytest.raises(ValueError):
                 pm.delete(bad)
         assert pm.get("fortune_teller") is not None
+
+    def test_delete_survives_non_utf8_marker(self, tmp_path):
+        """E1（REVIEW 2026-11-02）：marker 非 UTF-8 时 delete 不能半截完成。
+
+        旧实现在 unlink SOUL.md / rmdir **之后**才 read_text marker，
+        UnicodeDecodeError 直接逃出 ⇒ SOUL.md 已删、目录可能还在、调用方
+        看到异常（web 500 / admin 报错）。
+        """
+        pm = PersonaManager(tmp_path)
+        pm.save("mine", body="x", default=True)
+        marker = tmp_path / ".default_persona"
+        marker.write_bytes(b"\xff\xfe\x00bad")
+        assert pm.delete("mine") is True
+        assert not (tmp_path / "personas" / "mine" / "SOUL.md").exists()
+        # marker 读不出来 = 按「没标记过这个默认」处理，文件留着但不再指向已删人格
+        assert marker.is_file()
+
+    def test_default_survives_non_utf8_marker(self, tmp_path):
+        """E1：default() 读到坏 marker 必须回落而不是每轮抛异常。
+
+        engine 的 _build_system_prompt 对 default() 是 except → 空人格，
+        所以旧实现的表现是「静默每轮空人格」而不是崩进程。
+        """
+        pm = PersonaManager(tmp_path)
+        pm.save("mine", body="x")
+        marker = tmp_path / ".default_persona"
+        marker.write_bytes(b"\xff\xfe\x00bad")
+        # 不抛异常；落到根级 SOUL.md 之外的兜底（这里没有根 SOUL.md ⇒ None）
+        assert pm.default() is None
+
+    def test_blank_about_txt_does_not_break_loading(self, tmp_path):
+        """E2（REVIEW 2026-11-02）：ABOUT.txt 只有空白时 list() 不能 IndexError。
+
+        触发源是手写/编辑器保存/写一半被截断的 ABOUT.txt；影响面是整个人格
+        系统不可用（_scan → _ensure_loaded/refresh 全链无 try）。
+        """
+        for blank in ("\n", "   ", "\r\n", "\n\n\n"):
+            d = tmp_path / f"p{abs(hash(blank)) % 10000}" / "personas" / "tester"
+            d.mkdir(parents=True)
+            (d / "SOUL.md").write_text("# 标题\n正文\n", encoding="utf-8")
+            (d / "ABOUT.txt").write_text(blank, encoding="utf-8")
+            pm = PersonaManager(d.parent)
+            personas = pm.list()
+            assert len(personas) == 1
+            # 描述回落到首个标题，而不是 IndexError
+            assert personas[0].description == "标题"
+
+    def test_atomic_write_tmp_name_is_unique_per_write(self, tmp_path):
+        """E8：tmp 名只含 pid 时，同一人格的并发写会共用同一个 tmp 文件。"""
+        pm = PersonaManager(tmp_path)
+        seen = []
+        real_open = os.open
+
+        def spy(path, flags, mode=0o777, *, dir_fd=None):
+            if str(path).endswith(".tmp"):
+                seen.append(str(path))
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        import unittest.mock as _mock
+
+        with _mock.patch("os.open", spy):
+            pm.save("race", body="甲")
+            pm.save("race", body="乙")
+        assert len(seen) == 2, seen
+        assert seen[0] != seen[1], f"并发写会共用同一 tmp 文件：{seen}"
 
     def test_delete_clears_default_marker(self, personas_dir):
         pm = PersonaManager(personas_dir)

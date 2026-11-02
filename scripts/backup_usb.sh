@@ -21,11 +21,15 @@ MAX_AGE_H="${MAX_AGE_H:-30}"
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 
+# I3（REVIEW 2026-11-02）：KEEP=0 必须拒。旧校验只拒非数字，KEEP=0 时
+# `tail -n +1` 列出全部目录（含刚 mv 上去的当天份）⇒ 轮转把当天备份连同
+# 历史一起删掉，然后照常 log done 并 exit 0——假成功。agentcore/backup/
+# db_backup.py:861 的 keep = max(1, int(keep)) 早就夹紧了，这里补齐。
 # 与 backup_mirror.sh 的 M11 同款校验：KEEP 会拼进 `tail -n +$((KEEP + 1))`
 # 算术上下文，MAX_AGE_H 拼进 `-gt` 比较——坏值不该等于任意命令展开。
 case "$KEEP" in
-  '' | *[!0-9]*)
-    log "ERROR: KEEP 必须是非负整数（当前：$KEEP）"
+  '' | *[!0-9]* | 0)
+    log "ERROR: KEEP 必须是正整数（当前：$KEEP）"
     exit 2
     ;;
 esac
@@ -88,14 +92,31 @@ else
   log "ERROR: 既没有 .env 也没有 config/agent.json，拒绝打一份没有配置的冷备"
   exit 1
 fi
-"${RSYNC[@]}" "$SRC/config.yaml" "$TMP/"
+# I1（REVIEW 2026-11-02）：config.yaml 的位置也是二选一——宿主机部署在仓库根，
+# compose init 部署在 config/config.yaml（compose_init.py:317-370 / docker-compose.yml:78
+# AGENT_CONFIG=/app/config/config.yaml）。写死仓库根时 compose 项目目录里 rsync 源
+# 不存在，退 23 后被 set -euo pipefail 直接带走，且发生在下面的硬断言之前，连
+# 「冷备必含文件缺失」的自解释告警都没有。
+CONFIG_YAML_SRC=""
+for p in "$SRC/config/config.yaml" "$SRC/config.yaml"; do
+  if [ -f "$p" ]; then
+    CONFIG_YAML_SRC="$p"
+    break
+  fi
+done
+if [ -z "$CONFIG_YAML_SRC" ]; then
+  log "ERROR: 既没有 config/config.yaml 也没有 config.yaml，拒绝打一份没有引擎配置的冷备"
+  exit 1
+fi
+"${RSYNC[@]}" "$CONFIG_YAML_SRC" "$TMP/"
 # schema 版本 sidecar（M2）：加密备份的规范名已去掉 .age（<file>.sql.gz.schema.json），
 # 解密成 .sql.gz 后才能被 restore 的版本守卫读到。旧命名 <file>.age.schema.json
 # 也接受；两者都缺时冷备仍可做，但要在 journal 里留"无版本守卫"的痕。
 SCHEMA_SRC="${DUMP%.age}.schema.json"
 [ -f "$SCHEMA_SRC" ] || SCHEMA_SRC="$DUMP.schema.json"
 SCHEMA_NAME="${DUMP_NAME%.age}.schema.json"
-# 必含清单：dump + 上面选中的那个配置源 + config.yaml。早先这里写死 .env，
+# 必含清单：dump + 上面选中的那个配置源 + config.yaml（落点名固定为仓库根名，
+# 与 I1 的位置探测无关——冷备恢复时按宿主机布局解开）。早先这里写死 .env，
 # JSON 部署下必然缺一项（rsync 也先报错），整个 NAS 形态的冷备不可用。
 REQUIRED_FILES=("$DUMP_NAME" "$CONFIG_SRC" config.yaml)
 if [ -f "$SCHEMA_SRC" ]; then
@@ -173,7 +194,14 @@ while IFS= read -r dir; do
   pruned=$((pruned + 1))
 done < <(find "$USB_ROOT" -maxdepth 1 -type d -name 'agent-demo-????-??-??' \
   -printf '%T@ %p\n' | sort -rn | tail -n +$((KEEP + 1)) | cut -d' ' -f2-)
-[ "$pruned" -gt 0 ] || log "rotate: 无需清理（$(( $(find "$USB_ROOT" -maxdepth 1 -type d -name 'agent-demo-????-??-??' | wc -l) )) 份 ≤ KEEP=$KEEP）"
+# I4（REVIEW 2026-11-02）：find 失败（U 盘 IO 错误/权限）时管道末端 wc -l
+# 恒回 0，pipefail 也取末端退码 ⇒ 失败被完全掩盖，打出「无需清理（0 份）」
+# 而实际可能有超期份没删。命令替换的失败要显式接住。
+if ! total=$(find "$USB_ROOT" -maxdepth 1 -type d -name 'agent-demo-????-??-??' | wc -l); then
+  log "ERROR: 轮换计数失败（find 不可用），请人工检查 U 盘上的旧备份"
+  exit 1
+fi
+[ "$pruned" -gt 0 ] || log "rotate: 无需清理（$total 份 ≤ KEEP=$KEEP）"
 
 sync
 log "done: $DEST ($(du -sh "$DEST" | cut -f1))"

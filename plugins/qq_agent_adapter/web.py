@@ -38,7 +38,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agentcore.boolenv import env_bool
+from agentcore.boolenv import env_bool, env_flag
 from agentcore.diagnostics import recent as _recent_events
 from plugins.qq_agent_adapter import config_write as cw
 
@@ -992,7 +992,9 @@ def _gate_value(gate_key: str | None):
 
         spec = next((x for x in ENV_SPECS if x.key == gate_key), None)
         raw = spec.default if spec is not None else "1"
-    return (raw or "").strip().lower() not in {"0", "false", "no", "off"}
+    # G（REVIEW 2026-11-02）：走 boolenv——旧手解把脏值静默按**开**处理
+    # （配了 disabled 之类等于没关且无痕）；认不出时告警一次再回落默认（默认开）
+    return env_flag(gate_key, raw, True)
 
 
 def _clusters_payload(env_payload, yaml_payload) -> list[dict]:
@@ -4922,7 +4924,14 @@ def _mount_persona_write_routes(app, _auth) -> None:
         # personas/ 里的条目 default 恒为 False，默认人格由 .default_persona 标记
         # （或 PERSONAS_DEFAULT env）决定；只查 target.default 会漏掉标记指定的
         # 那个人，删掉后未选人格的用户静默失去兜底。
-        current_default = pm.default()
+        # E1（REVIEW 2026-11-02）：default() 已对坏 marker 全兜底，但为
+        # 防它将来再抛（它是「未选人格用户的兜底」查询，不该让人格删除页 500），
+        # 这里显式接住并按「无默认人格」处理——删默认人格的 409 保护宁可漏
+        # 触发（用户仍可用 /persona use 换默认），也不能让整个删除面不可用。
+        try:
+            current_default = pm.default()
+        except Exception:
+            current_default = None
         if current_default is not None and current_default.name == target.name:
             raise HTTPException(status_code=409, detail="persona_default")
         confirm_key = f"persona:delete:{name}"

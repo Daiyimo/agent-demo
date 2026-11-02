@@ -38,6 +38,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from agentcore.boolenv import env_flag
+
 logger = logging.getLogger(__name__)
 
 # agent.json 里的两个键（普通 JSON 值）
@@ -189,12 +191,9 @@ def validate_provider(raw: dict) -> Provider:
         base_url=base_url,
         model=model,
         api_key=api_key,
-        enabled=(
-            str(raw.get("enabled")).strip().lower()
-            not in {"0", "false", "no", "off", ""}
-            if isinstance(raw.get("enabled"), str)
-            else bool(raw.get("enabled", True))
-        ),
+        # G（REVIEW 2026-11-02）：走 boolenv——旧手解把 "enabled": "disabled"
+        # 这类脏值静默按**开**处理（provider 列表是 web 面板手写的 0600 JSON）
+        enabled=env_flag("llm-providers.enabled", raw.get("enabled"), True),
         temperature=temp,
         max_tokens=max_tokens,
     )

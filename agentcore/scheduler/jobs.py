@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Any
 
 from agentcore import tz as agent_tz
+from agentcore.boolenv import env_flag
 from agentcore.scheduler.push import parse_target
 
 logger = logging.getLogger(__name__)
@@ -210,12 +211,10 @@ def _validate_job(raw: Any, index: int) -> tuple[CronJob | None, str | None]:
     jid = str(raw.get("id") or "").strip() or _slug(name)
     if not _ID_RE.match(jid):
         return None, f"id 非法（64 位以内 A-Za-z0-9_-）：{jid!r}"
-    enabled_raw = raw.get("enabled", True)
-    enabled = (
-        str(enabled_raw).strip().lower() not in {"0", "false", "no", "off", ""}
-        if isinstance(enabled_raw, str)
-        else bool(enabled_raw)
-    )
+    # G（REVIEW 2026-11-02）：走 boolenv——旧手解把 "enabled": "disabled"
+    # 这类脏值静默按**开**处理（jobs.json 是手写的主机配置，拼错就该响）。
+    # 语义对齐：空串/缺省 = 开（与旧实现的 "" 分支一致）。
+    enabled = env_flag(f"jobs[{index}].enabled", raw.get("enabled"), True)
 
     sched = raw.get("schedule")
     if not isinstance(sched, dict):
