@@ -29,6 +29,7 @@ import logging
 
 from agentcore import tz
 from agentcore.scheduler.jobs import CronJob, parse_target, update_state
+from agentcore.scheduler.notify_budget import get_notify_budget
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,12 @@ class AgentTurnRunner:
         # 永触发表达式告警按 job 去重：tick 是 60s 一轮，不去重会把同一条错误
         # 刷 1440 次/天，把真正的告警埋掉。
         self._dead_warned: set[str] = set()
+        # 打扰预算告警按 job+目标去重：同一个 job 每分钟触发时，同一条"预算用尽"
+        # 也只该出现一次（与 _warn_acl_once 同思路）。
+        self._budget_warned: set[tuple[str, str]] = set()
+        # P3：全局打扰预算。agent_turn 原本是四类主动投递里唯一没有上限的——
+        # 一条 `* * * * *` 的 job 就能把一个群每分钟刷一遍。
+        self._budget = get_notify_budget()
 
     def _warn_once(self, msg: str) -> None:
         if msg == self._last_error:
@@ -145,6 +152,24 @@ class AgentTurnRunner:
         if kind == "private":
             return True
         return str(ident) in self.allowed_groups
+
+    def _warn_budget_once(self, job: CronJob, target: str) -> None:
+        """打扰预算用尽按 job+目标去重告警。
+
+        与 ACL 的区别：ACL 是启动期常量（不报第二次），预算每天会重置，所以恢复
+        后要能重新报。job+目标作 key 已经够细——同一 job 换个目标仍是另一条。
+        """
+        key = (job.id, target)
+        if key in self._budget_warned:
+            return
+        self._budget_warned.add(key)
+        logger.warning(
+            "cron job %s (%s) 的目标 %s 当日主动投递已达全局打扰预算上限，"
+            "本轮不执行也不投递（AGENT_NOTIFY_DAILY_LIMIT，按 job 去重告警）",
+            job.id,
+            job.name,
+            target,
+        )
 
     def _warn_acl_once(self, job: CronJob, target: str) -> None:
         key = (job.id, target)
@@ -179,6 +204,18 @@ class AgentTurnRunner:
         # 的模型输出出现在日志里）。仍推进下次执行时刻，否则 tick 会每 60s 重试一次。
         if not self._target_allowed(kind, ident):
             self._warn_acl_once(job, job.to)
+            update_state(
+                job.id,
+                status="failed",
+                next_run_ms=_next_run_ms(job.cron, job.tz),
+                path=self.jobs_file,
+            )
+            return "failed"
+        # 全局打扰预算（P3）：agent_turn 的产出是 LLM 生成正文，跑一轮要花 token，
+        # 所以预算闸必须放在引擎**之前**——省 LLM 调用，也省一次无意义的 tool-loop。
+        # 仍推进下次执行时刻：否则 tick 会每 60s 重试一次，把日志刷满。
+        if not self._budget.check(job.to, "agent_turn"):
+            self._warn_budget_once(job, job.to)
             update_state(
                 job.id,
                 status="failed",
@@ -223,9 +260,12 @@ class AgentTurnRunner:
                 next_run_ms=next_ms,
                 path=self.jobs_file,
             )
-            outcome = await self.sink.send_once(job.to, str(text))
+            outcome = await self.sink.send_once(job.to, str(text), ref=str(job.id))
             if outcome == "sent":
                 status = "ok"
+                # P3：只记确认送达的（uncertain 可能没到用户手上，记了会让预算
+                # 凭空少一格；push/nudge 同一口径）
+                self._budget.record(job.to, "agent_turn")
             elif outcome == "uncertain":
                 # 已发出、响应丢失：不当失败（不触发重试计数），但也不算成功
                 status = "uncertain"

@@ -475,7 +475,7 @@ class _FakeSink:
         self.outcome = outcome
         self.sent = []
 
-    async def send_once(self, target, message):
+    async def send_once(self, target, message, *, ref: str = "") -> str:
         self.sent.append((target, message))
         return self.outcome
 
@@ -488,7 +488,7 @@ class _InspectingSink:
         self.crash = crash
         self.seen = []
 
-    async def send_once(self, target, message):
+    async def send_once(self, target, message, *, ref: str = "") -> str:
         jobs, _ = J.load(self.path)
         self.seen.append((jobs[0].last_status, jobs[0].next_run_at_ms))
         if self.crash:
@@ -903,3 +903,79 @@ class TestStateSidecar:
         p = tmp_path / "jobs.json"
         J.save([_cron_job()], p)
         assert not J.state_path(p).exists()
+class TestNotifyBudgetGate:
+    """P3：agent_turn 也受全局打扰预算约束（此前 jobs.json 完全没有上限）。
+
+    变异锚点：去掉 ``run_job`` 里的预算闸 -> 前两条红；去掉 ``outcome == "sent"``
+    分支的 ``record`` -> 记账那条红；把 record 挪到 uncertain 分支 -> 不记账那条红。
+    """
+
+    @staticmethod
+    def _exhaust(runner, target="group:123"):
+        """把全局额度用光（用 push 占位：模拟"别的主动投递先用掉了"）。"""
+        from agentcore.scheduler.notify_budget import NotifyBudget
+
+        runner._budget = NotifyBudget(runner._budget.path, daily_limit=1)
+        runner._budget.record(target, "push")
+        return runner._budget
+
+    @pytest.mark.asyncio
+    async def test_exhausted_budget_skips_engine_run(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        monkeypatch.setenv("AGENT_CRON_DIR", str(tmp_path))
+        eng, sink = _FakeEngine(), _FakeSink()
+        runner = AgentTurnRunner(eng, sink, allowed_groups={"123"}, jobs_file=p)
+        budget = self._exhaust(runner)
+        with caplog.at_level(logging.WARNING, logger="agentcore.scheduler.agent_turn"):
+            status = await runner.run_job(J.load(p)[0][0])
+        assert status == "failed"
+        assert eng.calls == [], "撞预算闸不得跑引擎（省 LLM 调用，也不刷屏）"
+        assert sink.sent == [], "零投递"
+        assert budget.by_kind("group:123") == {"push": 1}, "被拦的一轮不记账"
+        assert "打扰预算" in caplog.text
+        # 被拦同样要推进下次执行时刻：否则 tick 每 60s 重试一次
+        jobs, _ = J.load(p)
+        assert jobs[0].last_status == "failed"
+        assert jobs[0].next_run_at_ms > 0
+
+    @pytest.mark.asyncio
+    async def test_sent_records_budget(self, tmp_path):
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        runner = AgentTurnRunner(
+            _FakeEngine(), _FakeSink(), allowed_groups={"123"}, jobs_file=p
+        )
+        assert await runner.run_job(J.load(p)[0][0]) == "ok"
+        assert runner._budget.by_kind("group:123") == {"agent_turn": 1}
+
+    @pytest.mark.asyncio
+    async def test_uncertain_is_not_recorded(self, tmp_path):
+        """结果不确定可能没到用户手上：记了会让预算凭空少一格。"""
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        runner = AgentTurnRunner(
+            _FakeEngine(),
+            _FakeSink(outcome="uncertain"),
+            allowed_groups={"123"},
+            jobs_file=p,
+        )
+        assert await runner.run_job(J.load(p)[0][0]) == "uncertain"
+        assert runner._budget.by_kind("group:123") == {}
+
+    @pytest.mark.asyncio
+    async def test_budget_warning_deduped_per_job(self, tmp_path, monkeypatch, caplog):
+        """预算每天会重置，恢复后要能重新报；同一 (job, 目标) 不重复报。"""
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        monkeypatch.setenv("AGENT_CRON_DIR", str(tmp_path))
+        runner = AgentTurnRunner(
+            _FakeEngine(), _FakeSink(), allowed_groups={"123"}, jobs_file=p
+        )
+        self._exhaust(runner)
+        with caplog.at_level(logging.WARNING, logger="agentcore.scheduler.agent_turn"):
+            await runner.run_job(J.load(p)[0][0])
+            await runner.run_job(J.load(p)[0][0])
+        assert caplog.text.count("打扰预算") == 1, caplog.text

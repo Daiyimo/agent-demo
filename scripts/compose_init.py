@@ -72,6 +72,8 @@ STATE_REDIRECTS = {
     "AGENT_NUDGE_HOTSPOT_FILE": "data/state/nudge-hotspot.json",
     "AGENT_REBOOT_NOTICE_FILE": "data/state/reboot-notice.json",
     "AGENT_PUSH_STATE_FILE": "data/state/push-state.json",
+    "AGENT_OUTBOX_FILE": "data/state/outbox.jsonl",
+    "AGENT_NOTIFY_BUDGET_FILE": "data/state/notify-budget.json",
 }
 
 # 部署者必须自己填的键（换机器就不一样，无法烤进公开镜像）。值为空或占位

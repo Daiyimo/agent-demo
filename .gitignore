@@ -81,6 +81,10 @@ data/2fa-secret.json
 # 重启回执与定时推送去重状态（含真实 QQ/群号），运行期生成，绝不入库
 data/reboot-notice.json
 data/push-state.json
+# 出站投递日志（Sink 三态结果，含真实 QQ/群号），运行期生成，绝不入库
+data/outbox.jsonl
+# 打扰预算记账（push/nudge/agent_turn 的主动投递计数，含真实 QQ/群号），运行期生成，绝不入库
+data/notify-budget.json
 
 # compose 部署把上面这批 data/ 根状态文件**重定向**进 data/state/
 # （scripts/compose_init.py 的 STATE_REDIRECTS），该目录本身也在 DATA_DIRS 里。

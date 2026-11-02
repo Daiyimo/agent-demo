@@ -171,9 +171,10 @@ push:
 - **权限红线**：群目标必须同时在 `ALLOWED_GROUPS` 白名单里（与主聊天同一套 ACL），不在名单里的
   任务会被**停用并私聊管理员**，一条消息都发不出去；`/push` 系列命令同样只给 SUPERUSERS
 - **防刷屏**（**弱上限**）：每个目标每日最多 `AGENT_PUSH_DAILY_CAP_PER_TARGET` 条
-  （默认 1，`0` = 不限）。计数落 `data/push-state.json`，重启/多进程基本生效，
-  但属于尽力而为的限流而非硬保证（停机窗口内被砍掉的投递不计入）；
-  超出则跳过本次并照常推进下次触发时间；正文长度受 `AGENT_PUSH_MAX_CHARS`（默认 500）截断，
+  （默认 1，`0` = 不限）。计数落在「打扰预算」共享文件 `data/state/notify-budget.json`
+  （0600 原子写），重启/多进程共享；但属于尽力而为的限流而非硬保证
+  （停机窗口内被砍掉的投递不计入，且只记「确认送达」）；超出则跳过本次并照常推进
+  下次触发时间；正文长度受 `AGENT_PUSH_MAX_CHARS`（默认 500）截断，
   该值同时用作 LLM 的输出上限
 - **失败处理**：投递失败按指数退避顺延重试（`AGENT_PUSH_RETRY_DELAY` 起、
   `AGENT_PUSH_MAX_RETRY_DELAY` 封顶）；连续失败 `AGENT_PUSH_MAX_FAILURES` 次（默认 5）就**停用该任务
@@ -241,6 +242,8 @@ jobs.json 是**"到点让 agent 跑一轮"**——`message` 当用户输入丢�
   （与定时推送 `_target_allowed` 同口径）
 - **投递三态**：复用 `Sink.send_once` 的 `sent`/`failed`/`uncertain`；**结果不确定时绝不重发**
   （超时/断连可能已送达），状态记 `uncertain` 而非 `ok`
+- **打扰预算**：跑引擎前先查全局预算（见下节），被拦时记 `failed` 并照常推进下次
+  执行时刻（否则每 tick 重试刷日志）；`outcome == "sent"` 才记账
 - **坏文件不阻塞启动**：JSON 坏/字段坏只告警并跳过对应条目（一个错 job 不废掉其余的），
   同一条错误按内容去重（不会 60s 刷一次）
 - **与 push 的分工**：push 是"配置驱动的公告"（LLM 按 prompt 生成、模板兜底、每日上限）；
@@ -252,6 +255,38 @@ jobs.json 是**"到点让 agent 跑一轮"**——`message` 当用户输入丢�
 `data/cron/jobs.json`），**默认 `enabled: false`**（避免一上线就误触发），
 按需改。
 
+
+## 打扰预算（push / nudge / agent_turn 共用）
+
+三类「无人值守主动搭话」原本各有一套上限且**互不知晓**：push 每个目标每日
+`AGENT_PUSH_DAILY_CAP_PER_TARGET` 条、nudge 每目标每日几条、jobs.json 的 agent_turn
+则**完全没有上限**——一条 `"* * * * *"` 的 job 就能把群每分钟刷一遍。合起来能给同一个
+目标一天发 20+ 条。
+
+`agentcore/scheduler/notify_budget.py` 给它们一个**共享计数器 + 一个全局日上限**：
+
+- **key** = 投递目标字符串（`group:<群号>` / `private:<QQ号>`，三类同形态，天然对齐）
+- **记哪些**：四类全都记账（push / nudge / agent_turn / remind），供 `/status` 与面板总览
+- **拦哪些**：只拦 push / nudge / agent_turn 三类「无人值守主动搭话」
+  （`GATED_KINDS`）。**remind 只记不拦**——用户显式预约的提醒被全局预算吞掉是
+  语义错误（他说了几点就是几点）
+- **天花板而非替代**：全局上限不替代各面自己的细分上限，两者取**先命中者**
+- **只记「确认送达」**：`sent`/`ok` 才记账，`uncertain` 不记——可能没到用户手上，
+  记了会让预算凭空少一格
+- **记账失败绝不影响投递**：`record()` 全包 try/except
+
+**配置**（两个键都是只读面，改完重启生效）：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `AGENT_NOTIFY_DAILY_LIMIT` | `8` | 同一目标当日三类主动投递的合计上限；`0` = 不限 |
+| `AGENT_NOTIFY_BUDGET_FILE` | `data/state/notify-budget.json` | 记账文件，0600 原子写，只存目标/类型/计数 |
+
+文件按日分桶（`KEEP_DAYS = 3`，单日目标数封顶 `MAX_TARGETS_PER_DAY = 2000`），
+清理以**当天为锚点**算窗口——未来日键（测试注入或时钟回拨）与过期日键一起丢，
+不会把当天整桶挤掉。push 的旧私有记账文件（`AGENT_PUSH_STATE_FILE`）在首次启动时
+被读一次、把历史当日计数搬进共享预算（共享计数为 0 才搬，避免重复导入把上限砍半），
+之后不再读写。
 
 ## 主动联系（nudge）
 
