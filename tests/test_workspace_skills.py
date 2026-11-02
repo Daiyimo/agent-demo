@@ -317,18 +317,24 @@ class TestSendWorkspaceFile:
         assert len(sent["content"]) > 6000
 
     @pytest.mark.asyncio
-    async def test_group_id_forwarded(self, reg, ws, monkeypatch):
+    async def test_group_context_denied_private_allowed(self, reg, ws, monkeypatch):
+        """D1：群聊不再能拉工作区文件（外泄通道），私聊超管仍可。"""
         seen = {}
 
         async def fake_send(user_id, content, filename, *, group_id=None, bot=None):
             seen["group_id"] = group_id
-            return "群文件已发送"
+            return "文件已发送"
 
         import agentcore.skills.file_sender as fs_sender
 
         monkeypatch.setattr(fs_sender, "send_markdown_file", fake_send)
-        await self._send(reg, "small.md", group_id="888")
-        assert seen["group_id"] == "888", "群聊要走群文件上传，不能私发"
+        out = await self._send(reg, "small.md", group_id="888")
+        assert "unknown skill" in out, "群内超管也不得把工作区文件发到群里"
+        assert seen == {}, "拒绝必须发生在读取/投递之前"
+
+        out = await self._send(reg, "small.md")
+        assert "文件已发送" in out
+        assert seen["group_id"] is None, "私聊投递不带群号"
 
     @pytest.mark.asyncio
     async def test_non_admin_rejected(self, reg, ws):

@@ -102,10 +102,12 @@ flowchart TB
 
 ### 3.1 文件与加载
 
-- **布局**（2026-10-28 起，OpenClaw/picoclaw 兼容）：`data/workspace/` 下靠**文件位置**标识人格，
+- **布局**（2026-10-28 起 OpenClaw/picoclaw 兼容；2026-10-29 从 `data/workspace/` 搬到
+  `data/personas/`——workspace 是 LLM 沙箱写面）：靠**文件位置**标识人格，
   纯 markdown、**无 frontmatter**（OpenClaw 的 SOUL.md 就是纯 md，加 frontmatter 会破坏两边互拷）
   ```
-  data/workspace/                  ← PERSONAS_DIR 可覆盖，容器内 /app/data/workspace（compose 已挂载）
+  data/personas/                  ← PERSONAS_DIR 可覆盖，容器内 /app/data/personas（compose 已挂载）
+                                    （默认平铺 `<名字>/SOUL.md`；PERSONAS_DIR 指向旧目录时仍是 `personas/<名字>/`）
   ├── SOUL.md                      ← 默认人格（根级，人格名固定 "default"）
   └── personas/
       ├── fortune_teller/SOUL.md   ← 可切换人格，**目录名 = 人格名**
@@ -118,8 +120,9 @@ flowchart TB
 - **Web 导入**：agent-web「人格」标签表单化导入/编辑/删除（`PersonaManager.save/delete`：
   原子写 0600、写完 refresh、两段确认 + 审计 + 覆盖前备份 `data/backups/personas/`），
   详见 `docs/features-interaction.md`「人格系统」一节
-- 兼容性：旧的 `agentcore/personas/*.md`（frontmatter 形态）已删除，不再读取；
-  迁移 = 把正文存成 `data/workspace/personas/<name>/SOUL.md`
+- 兼容性：更旧的 `agentcore/personas/*.md`（frontmatter 形态）已删除，不再读取；
+  迁移 = 把正文存成 `data/personas/<name>/SOUL.md`。从 `data/workspace/` 老布局升级时
+  `agentcore/migrate_layout.py` 在启动时**复制**（不搬）到新位，旧位仍可读但不推荐再写
 
 ### 3.2 作用域与选择
 
@@ -436,7 +439,7 @@ erDiagram
 | `AGENT_PERSONA_GROWTH_INTERVAL` | `30` | 成长触发轮数阈值；0 = 关闭 |
 | `AGENT_PERSONA_GROWTH_MAX_CHARS` | `500` | 成长层字符上限 |
 | `AGENT_GROUP_CONTEXT` | 视部署 | 群聊片段环形缓冲 |
-| `PERSONAS_DIR` | `agentcore/personas` | 人格目录 |
+| `PERSONAS_DIR` | `data/personas` | 人格目录。默认值时人格平铺为 `<目录>/<名字>/SOUL.md`；显式指到旧布局（如 `data/workspace`）时沿用 `<目录>/personas/<名字>/SOUL.md`，升级前的写入位置不变 |
 | `PERSONAS_DEFAULT` | 空（按 md `default`） | 默认人格名覆盖（本地用：优先于 md 的 default 字段；空白/不存在时回退 md 默认） |
 
 ---

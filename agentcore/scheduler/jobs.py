@@ -1,4 +1,4 @@
-"""OpenClaw 兼容的 cron 任务：``data/workspace/cron/jobs.json``（2026-10-28 需求②）。
+"""OpenClaw 兼容的 cron 任务：``data/cron/jobs.json``（2026-10-28 需求②）。
 
 **为什么用 jobs.json 取代 env 里的 ``*_CRON``**：用户明确要求「以后都采用这个格式」。
 OpenClaw / picoclaw 的 cron 就是 ``<workspace>/cron/jobs.json``，两边文件可直接互拷；
@@ -25,16 +25,23 @@ env 只能表达「一个表达式」，装不下 id / 开关 / 时区 / 投递�
           "channel": "onebot",
           "to": "group:2000000005"          # 复用 push.parse_target 的 group:/private:
         },
-        "state": {"nextRunAtMs": 0, "lastRunAtMs": 0, "lastStatus": ""},
-        "createdAtMs": 0, "updatedAtMs": 0,
+        "createdAtMs": 0,
         "deleteAfterRun": false
       }]
     }
 
+    data/cron/state.json              # 运行状态（执行体回写，别手改）
+    {"version": 1, "jobs": {"<id>": {"nextRunAtMs": 0, "lastRunAtMs": 0,
+                                     "lastStatus": ""}}}
+
 **落盘纪律**：``save`` 只补丁 ``jobs`` 一个键（与 llm providers 同一套口径），
 不碰 agent.json 之外的任何东西；原子写 + 0600 + 写后重读校验。
 ``state`` 由执行体回写（``lastRunAtMs`` / ``lastStatus`` / ``nextRunAtMs``），
-手改文件即生效（下次扫描/重启）。
+但**不再写回 jobs.json**（2026-10-29）：每次跑完都重写配置文件会把「配置」与
+「运行状态」搅在一起——备份 churn、与手改并发丢更新、OpenClaw 互拷时把本机
+运行时间带过去。状态落在同目录 ``state.json``（0600、原子写）。
+读的时候 sidecar 优先，**旧文件里内嵌的 ``state`` 仍作为回落**：升级后不必迁移，
+首次回写就把它转存到 sidecar；``save`` 也顺手把内存里的状态刷进 sidecar。
 """
 
 from __future__ import annotations
@@ -49,6 +56,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agentcore import tz as agent_tz
 from agentcore.scheduler.push import parse_target
 
 logger = logging.getLogger(__name__)
@@ -56,7 +64,8 @@ logger = logging.getLogger(__name__)
 CRON_DIR_ENV = "AGENT_CRON_DIR"
 JOBS_FILENAME = "jobs.json"
 _JOBS_KEY = "jobs"
-_DEFAULT_DIR = "data/workspace/cron"
+_DEFAULT_DIR = "data/cron"
+STATE_FILENAME = "state.json"
 _BACKUP_KEEP = 10
 
 # payload.kind：本项目只实现 agent_turn；其余记 WARNING 跳过（不静默丢弃）。
@@ -126,6 +135,56 @@ def jobs_path() -> Path:
     return cron_dir() / JOBS_FILENAME
 
 
+def state_path(path: Path | None = None) -> Path:
+    """运行状态 sidecar：与 jobs.json 同目录（``AGENT_CRON_DIR`` 一起生效）。"""
+    return (path or jobs_path()).with_name(STATE_FILENAME)
+
+
+def _read_state_sidecar(p: Path) -> dict[str, dict]:
+    """读状态 sidecar；缺失 = 全新部署（正常态），损坏告警后当空。"""
+    sp = state_path(p)
+    try:
+        raw = json.loads(sp.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(
+            "cron state sidecar 读不到，按内置 state 回落：%s", type(e).__name__
+        )
+        return {}
+    jobs = raw.get("jobs") if isinstance(raw, dict) else None
+    if not isinstance(jobs, dict):
+        return {}
+    return {str(k): v for k, v in jobs.items() if isinstance(v, dict)}
+
+
+def _write_state_sidecar(
+    p: Path, states: dict[str, dict], *, allow_empty: bool = False
+) -> None:
+    """原子写 0600。空状态默认不落文件（全新部署不留空壳）。"""
+    clean = {
+        str(k): {
+            "nextRunAtMs": _as_ms(v.get("nextRunAtMs")),
+            "lastRunAtMs": _as_ms(v.get("lastRunAtMs")),
+            "lastStatus": str(v.get("lastStatus") or ""),
+        }
+        for k, v in states.items()
+        if isinstance(v, dict)
+    }
+    clean = {
+        k: v
+        for k, v in clean.items()
+        if v["nextRunAtMs"] or v["lastRunAtMs"] or v["lastStatus"]
+    }
+    if not clean and not allow_empty:
+        return
+    sp = state_path(p)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    nl = chr(10)
+    text = json.dumps({"version": 1, "jobs": clean}, ensure_ascii=False, indent=2) + nl
+    _atomic_write(sp, text)
+
+
 # ---------------------------------------------------------------- 解析
 
 
@@ -171,11 +230,19 @@ def _validate_job(raw: Any, index: int) -> tuple[CronJob | None, str | None]:
     from apscheduler.triggers.cron import CronTrigger
 
     try:
-        CronTrigger.from_crontab(cron)
+        trigger = CronTrigger.from_crontab(cron)
     except Exception:
         return None, f"{name}: cron 无法解析：{cron!r}"
     tz_raw = str(sched.get("tz") or "").strip()
     tz = tz_raw or None
+    # 「能解析」不等于「会有下次执行」：`0 0 30 2 *`（2 月 30 日）from_crontab
+    # 成功，get_next_fire_time 却永远返回 None。这类 job 一旦放行，执行体算不出
+    # nextRunAtMs（返 0），而 tick 的到点判断 `if next_run_at_ms and ...` 把 0 当
+    # 「首次运行」——于是每 60s 跑一次完整 LLM 回合 + 投递，无限烧 token，且 job
+    # 永远不会被标记 failed（评审遗留项）。装载期就拒掉，错误走现成的 per-job
+    # errors 通道，由 AgentTurnRunner.tick 逐条告警。
+    if trigger.get_next_fire_time(None, agent_tz.now()) is None:
+        return None, f"{name}: cron 表达式永触发（不存在满足条件的日期）：{cron!r}"
 
     payload = raw.get("payload")
     if not isinstance(payload, dict):
@@ -270,7 +337,17 @@ def load(path: Path | None = None) -> tuple[list[CronJob], list[str]]:
         data = json.loads(text)
     except json.JSONDecodeError as e:
         raise JobsError(f"{p} 不是合法 JSON: {e}") from e
-    return parse_jobs(data)
+    jobs, errors = parse_jobs(data)
+    # sidecar 优先；旧文件内嵌的 state 只在该 id 还没进 sidecar 时生效（升级兼容）
+    states = _read_state_sidecar(p)
+    for job in jobs:
+        st = states.get(job.id)
+        if st is None:
+            continue
+        job.next_run_at_ms = _as_ms(st.get("nextRunAtMs"))
+        job.last_run_at_ms = _as_ms(st.get("lastRunAtMs"))
+        job.last_status = str(st.get("lastStatus") or "")
+    return jobs, errors
 
 
 # ---------------------------------------------------------------- 落盘
@@ -292,6 +369,14 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
+def _state_of(job: CronJob) -> dict:
+    return {
+        "nextRunAtMs": job.next_run_at_ms,
+        "lastRunAtMs": job.last_run_at_ms,
+        "lastStatus": job.last_status,
+    }
+
+
 def _dump_job(job: CronJob) -> dict:
     """导出回 OpenClaw 形态（与入参字段名一致，便于两边互拷）。"""
     return {
@@ -309,13 +394,7 @@ def _dump_job(job: CronJob) -> dict:
             "channel": job.channel,
             "to": job.to,
         },
-        "state": {
-            "nextRunAtMs": job.next_run_at_ms,
-            "lastRunAtMs": job.last_run_at_ms,
-            "lastStatus": job.last_status,
-        },
         "createdAtMs": job.created_at_ms,
-        "updatedAtMs": job.updated_at_ms,
         "deleteAfterRun": job.delete_after_run,
     }
 
@@ -323,9 +402,10 @@ def _dump_job(job: CronJob) -> dict:
 def save(jobs: list[CronJob], path: Path | None = None) -> None:
     """把 jobs 列表写回 jobs.json（原子 + 0600 + 写后重读校验）。
 
-    刻意**不做增量补丁**：jobs 的权威形态就是整个数组，执行体回写 state 时也是
-    读全量→改一条→写全量。文件小（几条到几十条），全量写的代价可忽略，
-    而增量补丁要处理「数组中间插入/删除」的下标漂移，复杂度不值。
+    刻意**不做增量补丁**：jobs 的权威形态就是整个数组。文件小（几条到几十条），
+    全量写的代价可忽略，而增量补丁要处理「数组中间插入/删除」的下标漂移，
+    复杂度不值。**运行状态不在这里**（见 ``state.json``），但内存里已有的状态会
+    顺手刷进 sidecar，保证两侧不漂。
     """
     p = path or jobs_path()
     if p.is_symlink():
@@ -351,7 +431,6 @@ def save(jobs: list[CronJob], path: Path | None = None) -> None:
             job.created_at_ms = now
             dumped["createdAtMs"] = now
         job.updated_at_ms = now
-        dumped["updatedAtMs"] = now
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
 
     backup = None
@@ -380,6 +459,7 @@ def save(jobs: list[CronJob], path: Path | None = None) -> None:
         else:
             p.unlink(missing_ok=True)
         raise JobsError("jobs_verify_failed_rolled_back") from None
+    _write_state_sidecar(p, {j.id: _state_of(j) for j in jobs})
     if [j.id for j in check] != [j.id for j in jobs]:
         if backup is not None:
             import shutil
@@ -392,12 +472,13 @@ def save(jobs: list[CronJob], path: Path | None = None) -> None:
 def update_state(
     job_id: str, *, status: str, next_run_ms: int = 0, path: Path | None = None
 ) -> None:
-    """执行体回写某条 job 的运行状态（读全量→改一条→写全量）。
+    """执行体回写某条 job 的运行状态（只写 ``state.json``，不碰 jobs.json）。
 
     ``path`` 与 :func:`load`/:func:`save` 同参数名，测试必须显式传入——否则会写
     到仓库里那份真实 jobs.json（2026-10-28 实测踩过：忘传 path 的测试把夹具值
     写进了 ``data/workspace/cron/jobs.json``）。
 
+    ``deleteAfterRun && ok`` 是唯一需要改 jobs.json 的路径（删任务）。
     失败只告警不抛：回写状态失败不该让「任务已经跑完」这件事本身失败。
     """
     try:
@@ -408,8 +489,16 @@ def update_state(
         hit.last_run_at_ms = _now_ms()
         hit.last_status = status
         hit.next_run_at_ms = next_run_ms
+        p = path or jobs_path()
         if hit.delete_after_run and status == "ok":
             jobs = [j for j in jobs if j.id != job_id]
-        save(jobs, path)
+            save(jobs, path)
+            states = _read_state_sidecar(p)
+            states.pop(job_id, None)
+            _write_state_sidecar(p, states, allow_empty=True)
+            return
+        states = _read_state_sidecar(p)
+        states[job_id] = _state_of(hit)
+        _write_state_sidecar(p, states)
     except Exception:
         logger.warning("cron job %s 状态回写失败", job_id, exc_info=True)

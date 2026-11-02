@@ -1,3 +1,7 @@
+import logging
+import re
+from pathlib import Path
+
 import pytest
 
 from agentcore.skills.registry import SkillRegistry
@@ -282,4 +286,173 @@ class TestReadOnlyFlag:
 
     def test_unknown_skill_fail_closed(self, reg):
         assert reg.is_read_only("nope") is False
+
+
+class TestGuestSurface:
+    """D1：群内 schema 才是真正的披露面，guest 标记必须 fail-closed。"""
+
+    @pytest.fixture
+    def reg(self):
+        from agentcore.skills.permissions import PermissionChecker
+
+        checker = PermissionChecker(
+            superusers={"111"}, group_extra_skills={"system_status"}
+        )
+        return SkillRegistry(permission_checker=checker)
+
+    def _populate(self, reg):
+        async def _now():
+            return "t"
+
+        async def _fetch(url=""):
+            return "u"
+
+        async def _fs_write(path=""):
+            return "w"
+
+        async def _status():
+            return "s"
+
+        reg.register("now", "时间", {"type": "object"}, guest=True)(_now)
+        reg.register("fetch_url", "抓网页", {"type": "object"})(_fetch)  # 未标 guest
+        reg.register("fs_write", "写文件", {"type": "object"}, permission="superuser")(
+            _fs_write
+        )
+        reg.register(
+            "system_status",
+            "系统只读",
+            {"type": "object"},
+            permission="superuser",
+            read_only=True,
+        )(_status)
+
+    @staticmethod
+    def _names(schemas):
+        return [s["function"]["name"] for s in schemas]
+
+    def test_register_defaults_guest_false(self, reg):
+        reg.register("t", "t", {"type": "object"})(lambda: "x")
+        assert reg.get_schemas("222", "123") == [], "默认不标 guest 即群内不可见"
+
+    def test_group_guest_only_guest_skills(self, reg):
+        self._populate(reg)
+        assert self._names(reg.get_schemas("222", "123")) == ["now"]
+
+    def test_group_superuser_no_superuser_schema(self, reg):
+        self._populate(reg)
+        names = self._names(reg.get_schemas("111", "123"))
+        assert "fs_write" not in names, "群内 superuser 不得看到写面技能"
+        assert "now" in names and "fetch_url" in names
+        assert "system_status" in names, "extra 里的只读超管技能对群内超管可见"
+
+    def test_private_superuser_sees_everything(self, reg):
+        self._populate(reg)
+        names = self._names(reg.get_schemas("111", None))
+        assert {"now", "fetch_url", "fs_write", "system_status"} <= set(names)
+
+    @pytest.mark.asyncio
+    async def test_group_superuser_execute_denied_as_unknown(self, reg):
+        self._populate(reg)
+        denied = await reg.execute("fs_write", user_id="111", group_id="123")
+        assert denied == "Error: unknown skill fs_write"
+        ok = await reg.execute("now", user_id="111", group_id="123")
+        assert ok == "t"
         reg.mark_read_only("nope")  # 条件注册的技能：静默跳过不报错
+
+    @pytest.mark.asyncio
+    async def test_group_denial_warns_once_per_skill_and_group(self, reg, caplog):
+        """群内拒绝要在管理侧留痕，但不能刷屏（A5，2026-10-29 补）。
+
+        拒绝响应必须仍是 unknown 同款（无探测口）；告警按 ``(技能, 群)`` 去重，
+        真正的 unknown 名字一条都不打——否则 tool-loop 重试会把日志灌满。
+        """
+        self._populate(reg)
+        with caplog.at_level(logging.WARNING, logger="agentcore.skills.registry"):
+            first = await reg.execute("fs_write", user_id="111", group_id="123")
+            second = await reg.execute("fs_write", user_id="111", group_id="123")
+            await reg.execute("fs_write", user_id="111", group_id="456")
+        assert first == second == "Error: unknown skill fs_write"
+        warns = [r.getMessage() for r in caplog.records if "fs_write" in r.getMessage()]
+        assert len(warns) == 2, warns
+        assert sum("group=123" in m for m in warns) == 1
+        assert sum("group=456" in m for m in warns) == 1
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="agentcore.skills.registry"):
+            out = await reg.execute("nope", user_id="111", group_id="123")
+        assert out == "Error: unknown skill nope"
+        assert "群内技能调用被拒" not in caplog.text
+
+
+class TestGuestDocDrift:
+    """D6：文档里的访客名单必须与代码里 ``guest=True`` 的技能严格对齐。
+
+    访客面是 fail-closed 白名单：漏标即不可见（安全），但文档写了代码没标就是
+    「说好的功能没生效」；反过来代码标了文档没写，运维就不知道谁在群里看得见。
+    2026-10-29 起两向都由本类守住。
+    """
+
+    DOC = Path(__file__).resolve().parents[1] / "docs" / "features-skills.md"
+
+    # 不在 builtin 注册表里的访客技能：点歌/群统计由插件层按开关注册，
+    # reminder 三件套要 sink+memory（register_reminder_skills），各自有专门断言。
+    EXTERNAL = {
+        "play_music",
+        "my_group_review",
+        "reminder_add",
+        "reminder_list",
+        "reminder_cancel",
+    }
+    # 文档以 ``wiki_*`` 通配写（站点由 AGENT_WIKI_SITES 决定，名字不固定）
+    WILDCARD_PREFIXES = ("wiki_",)
+
+    def _documented(self) -> set[str]:
+        text = self.DOC.read_text(encoding="utf-8")
+        start = text.index("访客名单（`guest=True`")
+        end = text.index("**漏标 = 不可见", start)
+        segment = text[start:end]
+        # 只收「完整技能名」的反引号 token；``wiki_*`` 这类通配写法跳过（按站点注册）
+        return {m for m in re.findall(r"`([a-z][a-z0-9_]*)`", segment) if m != "guest"}
+
+    @staticmethod
+    def _builtin():
+        from agentcore.skills.builtin import register_builtin_skills
+
+        reg = SkillRegistry()
+        register_builtin_skills(reg)
+        return reg
+
+    def test_documented_guest_skills_are_registered_and_marked(self):
+        reg = self._builtin()
+        documented = self._documented()
+        assert "now" in documented and "calc" in documented, "文档里必须留有访客名单"
+        absent = documented - set(reg.skills)
+        assert absent <= self.EXTERNAL, (
+            f"文档访客名单里这些名字既没注册也不在外部清单（疑似笔误）：{sorted(absent - self.EXTERNAL)}"
+        )
+        for name in sorted(documented - self.EXTERNAL):
+            assert reg.skills[name].guest is True, (
+                f"{name} 写进了文档访客名单，但代码没标 guest=True（群访客看不到）"
+            )
+
+    def test_registered_guest_skills_are_documented(self):
+        reg = self._builtin()
+        documented = self._documented()
+        missing = {
+            n
+            for n, sk in reg.skills.items()
+            if sk.guest
+            and n not in documented
+            and not n.startswith(self.WILDCARD_PREFIXES)
+        }
+        assert not missing, (
+            f"这些技能标了 guest=True 但没写进文档访客名单：{sorted(missing)}"
+        )
+
+    def test_reminder_trio_is_guest_visible(self):
+        """reminder 三件套由适配层注册（要 sink+memory），单独验 guest 标记。"""
+        from agentcore.skills.reminder_skills import register_reminder_skills
+
+        reg = SkillRegistry()
+        register_reminder_skills(reg, object(), object())
+        for name in ("reminder_add", "reminder_list", "reminder_cancel"):
+            assert reg.skills[name].guest is True, name

@@ -24,6 +24,7 @@ class Skill:
         permission: str = "public",
         manifest: Any = None,
         read_only: bool = False,
+        guest: bool = False,
     ):
         self.name = name
         self.description = description
@@ -34,6 +35,10 @@ class Skill:
         # 只读声明：引擎据此判断一步内的多个工具调用可否并行执行。
         # 默认 False——副作用类工具（发文件/写工作区/提醒增删）绝不能并行。
         self.read_only = read_only
+        # 访客面：群内**非 superuser** 成员可见/可调。默认 False = 只给 owner
+        # （私聊或群内管理员）——"public" 只影响私聊默认可见性，群友面是
+        # fail-closed 白名单（见 permissions.PermissionChecker docstring）。
+        self.guest = guest
 
     def to_openai_schema(self) -> dict:
         return {
@@ -52,6 +57,27 @@ class SkillRegistry:
     def __init__(self, permission_checker: PermissionChecker | None = None):
         self.skills: dict[str, Skill] = {}
         self.permission_checker = permission_checker
+        # 群内拒绝告警的去重键：``(技能名, group_id)``。同一条幻觉调用在
+        # tool-loop 里会连续重试若干次，逐条 WARNING 会盖住真正的故障。
+        self._denied_warned: set[tuple[str, str]] = set()
+
+    def _warn_denied_once(self, name: str, group_id: str | None) -> None:
+        """群内调用被拒时留痕（私聊拒绝不在此列：ACL 在入站就挡掉了）。
+
+        文案不泄露「该技能存在」以外的信息，也不返回给模型——拒绝响应仍是
+        unknown 同款。
+        """
+        if not group_id:
+            return
+        key = (name, str(group_id))
+        if key in self._denied_warned:
+            return
+        self._denied_warned.add(key)
+        logger.warning(
+            "群内技能调用被拒：skill=%s group=%s（schema 已隐藏；同名同群只告警一次）",
+            name,
+            group_id,
+        )
 
     def register(
         self,
@@ -61,6 +87,7 @@ class SkillRegistry:
         permission: str = "public",
         manifest: Any = None,
         read_only: bool = False,
+        guest: bool = False,
     ):
         def decorator(handler: Handler):
             self.skills[name] = Skill(
@@ -71,6 +98,7 @@ class SkillRegistry:
                 permission,
                 manifest,
                 read_only,
+                guest,
             )
             return handler
 
@@ -99,12 +127,16 @@ class SkillRegistry:
         self.permission_checker = checker
 
     def get_schemas(
-        self, user_id: str | None = None, group_id: str | None = None
+        self,
+        user_id: str | None = None,
+        group_id: str | None = None,
+        *,
+        owner: bool = False,
     ) -> list[dict]:
         return [
             s.to_openai_schema()
             for s in self.skills.values()
-            if self._is_allowed(s, user_id, group_id)
+            if self._is_allowed(s, user_id, group_id, owner=owner)
         ]
 
     async def execute(
@@ -113,14 +145,19 @@ class SkillRegistry:
         /,
         user_id: str | None = None,
         group_id: str | None = None,
+        owner: bool = False,
         **kwargs,
     ) -> str:
         skill = self.skills.get(name)
         if not skill:
             return f"Error: unknown skill {name}"
-        if not self._is_allowed(skill, user_id, group_id):
+        if not self._is_allowed(skill, user_id, group_id, owner=owner):
             # 拒绝与 unknown 同文案（「直接忽略」语义）：对无权限者不确认
-            # 该技能的存在——schema 未过滤到的幻觉调用得不到任何探针信息
+            # 该技能的存在——schema 未过滤到的幻觉调用得不到任何探针信息。
+            # 但管理侧要能看见「模型在群里点了不该点的工具」：按 (技能, 群)
+            # 去重打一条 WARNING（不进拒绝文案、不逐条刷屏；tool-loop 里
+            # 同一条会连续重试，逐条日志会把真正的告警埋掉）。
+            self._warn_denied_once(name, group_id)
             return f"Error: unknown skill {name}"
         try:
             params = dict(kwargs)
@@ -147,19 +184,35 @@ class SkillRegistry:
             return "Error: skill 执行失败，请稍后再试。"
 
     def is_allowed(
-        self, skill_name: str, user_id: str | None, group_id: str | None
+        self,
+        skill_name: str,
+        user_id: str | None,
+        group_id: str | None,
+        *,
+        owner: bool = False,
     ) -> bool:
         skill = self.skills.get(skill_name)
         if not skill:
             return False
-        return self._is_allowed(skill, user_id, group_id)
+        return self._is_allowed(skill, user_id, group_id, owner=owner)
 
     def _is_allowed(
-        self, skill: Skill, user_id: str | None, group_id: str | None
+        self,
+        skill: Skill,
+        user_id: str | None,
+        group_id: str | None,
+        *,
+        owner: bool = False,
     ) -> bool:
         if self.permission_checker:
             return self.permission_checker.is_allowed(
-                skill.name, user_id, group_id, skill_permission=skill.permission
+                skill.name,
+                user_id,
+                group_id,
+                skill_permission=skill.permission,
+                guest=skill.guest,
+                read_only=skill.read_only,
+                owner=owner,
             )
         return skill.permission == "public"
 
@@ -209,6 +262,7 @@ class SkillRegistry:
             handler=handler,
             permission=manifest.permission,
             manifest=manifest,
+            guest=bool(getattr(manifest, "guest", False)),
         )
         logger.info("Installed skill: %s", manifest.name)
 

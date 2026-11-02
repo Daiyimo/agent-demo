@@ -162,6 +162,7 @@ COPY --chown=app:app bot.py config.yaml ./
 # 起 compose_init 生成的是 JSON 而不是从 .env.example 改写，它只在宿主机
 # `scripts/deploy.py env`（systemd 部署）里用得到，容器里带着只是 47KB 死重量
 COPY --chown=app:app scripts/compose_init.py ./scripts/
+COPY --chown=app:app docs/examples/cron-jobs.example.json ./docs/examples/
 
 # /app 目录本身的属主给 app：web 受控写面对 .env / config.yaml 的原子写在**同目录**
 # 建 *.tmp.write（config_write.atomic_write），目录属主不变时挂载了也写不进去
@@ -181,7 +182,7 @@ COPY --chown=app:app data/fonts ./data/fonts
 # 宿主机部署也有地方落。
 RUN mkdir -p data/logs data/archive data/backups data/budget data/workspace \
         data/cache data/sessions data/privacy data/skills data/kb_samples \
-        data/state data/mirror data/ssh config \
+        data/state data/mirror data/ssh data/cron data/personas config \
     && chown -R app:app data config
 
 COPY --chown=app:app scripts/docker-entrypoint.sh /usr/local/bin/

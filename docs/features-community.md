@@ -196,8 +196,10 @@ jobs.json 是**"到点让 agent 跑一轮"**——`message` 当用户输入丢�
 `<workspace>/cron/jobs.json`，用同一份格式可以两边直接互拷；env 只能表达一个表达式，
 装不下 id / 开关 / 时区 / 投递目标 / 运行状态。
 
-**落点**：`data/workspace/cron/jobs.json`（容器内 `/app/data/workspace/cron`，compose 已挂
-`data/workspace`）。目录可用 `AGENT_CRON_DIR` 覆盖。
+**落点**：`data/cron/jobs.json`（容器内 `/app/data/cron`，compose 已单独挂载）。目录可用 `AGENT_CRON_DIR` 覆盖。
+**运行状态在同目录 `state.json`**（0600，非 OpenClaw 格式的附加文件）：`nextRunAtMs` /
+`lastRunAtMs` / `lastStatus` 只由执行体回写，`jobs.json` 保持人手改的形状；从旧版本
+升级时内嵌在 `jobs.json` 里的 `state` 仍会被读入并迁到 sidecar（旧文件不删）。
 
 ```json
 {
@@ -233,7 +235,10 @@ jobs.json 是**"到点让 agent 跑一轮"**——`message` 当用户输入丢�
 - **生效方式**：手改保存即生效（下个轮询周期，默认 60s），**无需重启**——tick 每轮重读文件
 - **人格与历史**：人格走默认分支（根级 `SOUL.md`）；**不带对话历史**（无人值守任务，
   隔离单轮更可预期，也不会把群里几天聊天灌进 prompt）
-- **权限红线**：群目标必须在 `ALLOWED_GROUPS` 白名单里，否则不会投递（与主聊天同一套 ACL）
+- **权限红线**：群目标必须在 `ALLOWED_GROUPS` 白名单里，否则**不跑 agent 回合、不投递**，
+  job 记 `failed` 并告警（按 job+目标去重；仍推进下次执行时刻，避免每 60s 重试刷屏）。
+  私聊目标不受群白名单约束——jobs.json 是部署者本机的配置，发给谁是运维决定
+  （与定时推送 `_target_allowed` 同口径）
 - **投递三态**：复用 `Sink.send_once` 的 `sent`/`failed`/`uncertain`；**结果不确定时绝不重发**
   （超时/断连可能已送达），状态记 `uncertain` 而非 `ok`
 - **坏文件不阻塞启动**：JSON 坏/字段坏只告警并跳过对应条目（一个错 job 不废掉其余的），
@@ -243,7 +248,8 @@ jobs.json 是**"到点让 agent 跑一轮"**——`message` 当用户输入丢�
   是**系统运维任务**，仍走 env——用 agent_turn 间接表达它们只会更脆（多一层 LLM 依赖，
   失败时连备份都不会做）
 
-仓库自带一份样例 `data/workspace/cron/jobs.json`，**默认 `enabled: false`**（避免一上线就误触发），
+仓库自带一份样例 `docs/examples/cron-jobs.example.json`（首启由 `compose_init` 复制成
+`data/cron/jobs.json`），**默认 `enabled: false`**（避免一上线就误触发），
 按需改。
 
 

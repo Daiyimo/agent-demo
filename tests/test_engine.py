@@ -7,6 +7,7 @@ import pytest
 
 from agentcore.loop.engine import AgentEngine, _sanitize_history
 from agentcore.memory.store import InMemoryMemoryStore
+from agentcore.skills.permissions import PermissionChecker
 from agentcore.skills.registry import SkillRegistry
 
 
@@ -1818,7 +1819,20 @@ class TestSearchResultFence:
 
     @pytest.mark.parametrize(
         "tool_name",
-        ["run_shell", "run_command", "log_tail", "docker_logs", "docker_stats"],
+        [
+            "run_shell",
+            "run_command",
+            "log_tail",
+            "docker_logs",
+            "docker_stats",
+            # 宿主机只读状态族（2026-11-02 架构评审补入）：ps argv / unit
+            # Description / netstat 对端地址同样是主机侧可控文本。
+            "system_status",
+            "proc_detail",
+            "disk_usage",
+            "port_check",
+            "service_status",
+        ],
     )
     @pytest.mark.asyncio
     async def test_superuser_tool_results_are_fenced(self, tool_name):
@@ -1826,7 +1840,9 @@ class TestSearchResultFence:
         （bash/curl/系统日志/容器日志），必须与 search_*/ssh_run 同等过围栏
         ——未围栏直达持有 proc_kill/run_shell/fs_delete 的超管工具循环。
         docker_stats 同列：容器名可被攻击者控制（``docker run --name "<注入>"``
-        即把载荷送进超管工具循环）。
+        即把载荷送进超管工具循环）。system_status 族同列：ps 的 argv、
+        systemctl status 的 unit Description、netstat 的对端地址都可被主机侧
+        文本影响（2026-11-02 补）。
         """
         llm = FakeLLM(
             [
@@ -3491,3 +3507,133 @@ class TestMentionIsNotSpeaker:
         await engine.run({"user_id": "1"}, "hi")
         prompt = llm.calls[0]["messages"][0]["content"]
         assert "被提及的群成员（第三方）" not in prompt
+
+
+class _SpyGrowth:
+    def __init__(self):
+        self.calls = []
+
+    async def maybe_trigger(self, user_id, session_id):
+        self.calls.append((user_id, session_id))
+
+
+class TestCronOwnerTurn:
+    """AC D4 M2：cron ``agent_turn`` 是 owner 代理 + 隔离会话（2026-10-29）。"""
+
+    @staticmethod
+    def _context(*, isolated=True):
+        return {
+            "user_id": "cron:daily",
+            "group_id": None,
+            "owner": True,
+            "isolated": isolated,
+            "route": "cron:daily",
+        }
+
+    @pytest.mark.asyncio
+    async def test_isolated_turn_skips_facts_and_growth(self, monkeypatch):
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(FakeLLM([]), SkillRegistry(), memory)
+        growth = _SpyGrowth()
+        engine.growth = growth
+        remembered = []
+
+        async def _spy_remember(*a, **k):
+            remembered.append(a)
+
+        monkeypatch.setattr(engine, "_remember_facts", _spy_remember)
+        engine.llm.responses.extend(
+            [
+                {"choices": [{"message": {"content": "日报"}}]},
+                {"choices": [{"message": {"content": "日报"}}]},
+            ]
+        )
+        await engine.run(self._context(), "生成日报")
+        assert remembered == [], "隔离会话不得抽取长期事实"
+        assert growth.calls == [], "隔离会话不得推进人格成长"
+        # 对照：同一个 engine 换成普通私聊回合，两个副作用都必须发生
+        await engine.run({"user_id": "111"}, "生成日报")
+        assert len(remembered) == 1
+        assert growth.calls != []
+
+    @pytest.mark.asyncio
+    async def test_isolated_session_uses_private_namespace(self):
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(
+            FakeLLM([{"choices": [{"message": {"content": "ok"}}]}]),
+            SkillRegistry(),
+            memory,
+        )
+        await engine.run(self._context(), "hi")
+        # 内存实现的会话键是命名空间化的字面量（PG 侧同一语义落 sessions 行），
+        # 直接看键名才能锁住「不借目标群、也没有 g:<gid>:<gid> 自我对话键」（C2）
+        assert "p:cron:daily" in memory.sessions
+        assert not [k for k in memory.sessions if k.startswith("g:")]
+        key = await memory.resolve_session("cron:daily", None)
+        group_key = await memory.resolve_session("123", "123")
+        assert key not in (group_key, await memory.resolve_session("123", None))
+        hist = await memory.get_history(key)
+        assert [m["role"] for m in hist] == ["user", "assistant"]
+        assert await memory.get_history(group_key) == []
+
+    @pytest.mark.asyncio
+    async def test_budget_route_is_cron_job(self):
+        from agentcore.budget import current_route
+
+        seen = {}
+        engine = AgentEngine(FakeLLM([]), SkillRegistry(), InMemoryMemoryStore())
+
+        async def where():
+            seen["route"] = current_route.get()
+            return "route"
+
+        engine.skills.register(
+            "where", "报出当前预算路由", {"type": "object"}, permission="public"
+        )(where)
+        call = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "function": {"name": "where", "arguments": "{}"},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        engine.llm.responses.extend(
+            [call, {"choices": [{"message": {"content": "done"}}]}]
+        )
+        await engine.run(self._context(), "路由？")
+        assert seen["route"] == "cron:daily"
+        # 对照：不给 route 时仍是私聊维度（旧行为不变）
+        seen.clear()
+        engine.llm.responses.extend(
+            [call, {"choices": [{"message": {"content": "done"}}]}]
+        )
+        await engine.run({"user_id": "111"}, "路由？")
+        assert seen["route"] == "private:111"
+
+    @pytest.mark.asyncio
+    async def test_owner_sees_superuser_skills(self):
+        engine = AgentEngine(FakeLLM([]), SkillRegistry(), InMemoryMemoryStore())
+        engine.skills.set_permission_checker(PermissionChecker(superusers=set()))
+
+        async def secret_op():
+            return "ok"
+
+        engine.skills.register(
+            "secret_op", "超级用户技能", {"type": "object"}, permission="superuser"
+        )(secret_op)
+        engine.llm.responses.extend([{"choices": [{"message": {"content": "x"}}]}])
+        await engine.run(self._context(), "hi")
+        names = [t["function"]["name"] for t in engine.llm.calls[0]["tools"]]
+        assert "secret_op" in names, "cron owner 代理必须看到 superuser 级技能"
+        # 对照：普通群访客（非 owner）看不到——owner 标记不能被无视
+        engine.llm.responses.extend([{"choices": [{"message": {"content": "x"}}]}])
+        await engine.run({"user_id": "111", "group_id": "123"}, "hi")
+        names2 = [t["function"]["name"] for t in engine.llm.calls[1]["tools"]]
+        assert "secret_op" not in names2

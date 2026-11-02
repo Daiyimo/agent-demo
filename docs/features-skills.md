@@ -21,10 +21,12 @@
 | `AGENT_HA_BASE_URL` + `AGENT_HA_TOKEN` + `AGENT_HA_ENTITIES` | **必配**（启用 `ha_*`） | 空 = 整个功能关闭 | HA 地址 / 长期令牌 / 实体登记表；令牌不进 Web 写面 |
 | `AGENT_HELP_IMAGE` | 选配 | `1` | `/help` 图片菜单（缺 Pillow/字体自动退回文本） |
 | `AGENT_SKILLS_DIR` | 选配 | `data/skills` | prompt 型（`*.yaml`）与自定义代码型（`*.py`）技能共用目录 |
+| `AGENT_GROUP_EXTRA_SKILLS` | 选配 | 空 | 群内 superuser 额外可见的**只读**技能（csv/分号/空白分隔）。未知名或非只读项启动告警并忽略；群内普通成员永不可见 |
 
 ## 工具集（skills）
 
-模型可调用的工具按用途分组（`/skills` 可查当前可见性；`superuser` 类仅管理员可见）：
+模型可调用的工具按用途分组（`/skills` 可查当前可见性；`superuser` 类仅管理员可见；
+**群聊还有一层 where 轴**——普通群成员只看到访客名单，见「群聊访客模式」）：
 
 | 分类 | 工具 | 权限 | 说明 |
 |---|---|---|---|
@@ -112,7 +114,7 @@
 
 `data/workspace/`（可用 `WORKSPACE_DIR` 覆盖，已 gitignore）是 LLM 的临时/缓存/产物目录。相关技能**仅管理员（SUPERUSERS）可用**：
 
-- `fs_list / fs_read / fs_write / fs_mkdir`：读写工作区，路径锁定（`..` / 绝对路径 / 越界符号链接拒绝）。`fs_read` 单次最多返回 6000 字符（内容要进 prompt）——**要原样发整个文件用 `send_markdown_file` 的 `path` 参数（或 `send_workspace_file`）**：它由服务端直读后投递、不经过模型，因此没有这个截断；二进制与读不到的文件会如实拒绝而不是发个损坏文件
+- `fs_list / fs_read / fs_write / fs_mkdir`：读写工作区，路径锁定（`..` / 绝对路径 / 越界符号链接拒绝）。**根下的 `SOUL.md` / `personas` / `cron` 是保留名**（人格与定时任务配置的落点，不属于工作区）：写 / 建目录 / 删除一律拒绝（大小写不敏感），读取仍允许（旧布局迁移与排障要用）。**解压（`extract`）同样不能落到这些根**：它自己用 `os.open` 写盘、不过 `fs_write`，所以共用 `workspace/fs.py:reserved_root` 判定（`dest="cron"` 会在预扫描后即被拒），否则「写了假的还以为成功」还能从解压通道复现。`fs_read` 单次最多返回 6000 字符（内容要进 prompt）——**要原样发整个文件用 `send_markdown_file` 的 `path` 参数（或 `send_workspace_file`）**：它由服务端直读后投递、不经过模型，因此没有这个截断；二进制与读不到的文件会如实拒绝而不是发个损坏文件
 - `fs_delete`：需在聊天中回复「确认删除 XXXX」二次确认（确认码 8 位、10 分钟有效、连续输错作废）
 - `run_command`：白名单命令执行（**不经 shell、逐参数校验**、20s 超时、输出流式截断、审计日志带操作者）
   - 允许：`git`(只读子命令 + 安全选项)、`grep/cat/ls/head/tail/wc/pwd`、`find`(仅搜索动作)、`curl`(GET-only https)。压缩/解压不在白名单内：解压用 `extract` 技能、打包用 `pack_zip` 技能（Python 标准库实现，2026-10-18 H1 方案 B——外部 zip/unzip/tar 退役，见下文「压缩与解压」节）
@@ -180,6 +182,31 @@ AGENT_HA_ENTITIES=light.living_room,switch.desk_plug,sensor.living_temp
 - **敏感域两段确认**：`lock` / `cover` / `alarm_control_panel` / `climate` 首次调用只返回确认码（120s 有效，与参数绑定），带同一确认码且参数完全一致地二次调用才执行；一次确认只消费一次
 - **结果过围栏**：设备上报的状态、friendly_name 与属性属于设备侧可控文本，技能内用 `safety.fence_untrusted` 包裹后再返回（写入历史的 tool 结果同样带围栏）
 - **权限**：`permission="superuser"`（schema 过滤）+ handler `is_superuser` 双层；`ha_control` 另需 `AGENT_PERMISSION_LEVEL` ≥ `medium`（`low` 档不注册，handler 内复查）
+
+## 群聊访客模式（where 轴）
+
+群聊是多人场合，**schema 披露本身就是泄漏**（模型会照着念、也会被群友套话）。因此技能的
+可见性不只看「是谁」，还看「在哪儿」：
+
+| 场景 | 可见技能 |
+|---|---|
+| 私聊 superuser | 全部（与以前一致） |
+| 私聊普通用户 | 由 `skills.default_permission` 与显式授权决定（群白名单群除外，见下） |
+| **群聊 superuser** | 非 `superuser` 级技能 + `AGENT_GROUP_EXTRA_SKILLS` 里**只读**的 superuser 技能 |
+| **群聊普通成员（访客）** | 只有标了 `guest=True` 的技能（再叠加群授权，如点歌白名单） |
+
+访客名单（`guest=True`，约 15 个）：`now` / `date_calc` / `calc` / `unit_convert` / `random` /
+`get_weather` / `wiki_*`（`AGENT_WIKI_SITES` 启用的站点）/ `xiaoheihe_post` /
+`reminder_add` / `reminder_list` / `reminder_cancel` / `my_group_review`，以及按开关注册的
+`play_music`（仍需群白名单）。**漏标 = 不可见（fail-closed）**，所以新增技能默认对群访客关闭，
+要开放必须显式写 `guest=True` 并在这里补一行。
+
+无权限与「技能不存在」返回同一句 `unknown skill`（无探测口）；群内模型硬调被拒的技能会累计
+`unknown_calls`，连续 3 次触发 tool-loop breaker。
+
+```env
+AGENT_GROUP_EXTRA_SKILLS=system_status,proc_detail   # 仅群内 superuser；只收只读技能
+```
 
 ## 权限级别与管理员动作类能力（service_ctrl / docker_* / proc_kill / run_build_script）
 

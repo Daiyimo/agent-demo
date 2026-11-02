@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from agentcore.boolenv import env_bool
 from agentcore.diagnostics import recent as _recent_events
 from plugins.qq_agent_adapter import config_write as cw
 
@@ -90,7 +91,11 @@ _confirm_fails: dict[str, list[int]] = {}
 
 
 def _write_enabled() -> bool:
-    return bool(_allow_cidrs()) and (os.getenv("AGENT_WEB_WRITE") or "").strip() == "1"
+    # L7（REVIEW-ee39c8e..e55cab5）：布尔 env 统一走 boolenv。旧写法只认字面
+    # "1"，`AGENT_WEB_WRITE=true/yes/on` 会被静默判成关——运维以为开了写面、
+    # 实际整个写路由没挂，而日志里一行记录都没有。认不出的值（如 `disabled`）
+    # 告警一次后仍按**关**处理：这道门禁的方向不变，只是不再静默。
+    return bool(_allow_cidrs()) and env_bool("AGENT_WEB_WRITE", False)
 
 
 def _client_ip(request) -> str:

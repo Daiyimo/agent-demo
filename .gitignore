@@ -71,7 +71,6 @@ data/backups/
 # 旧版多 LLM provider 配置（含 API key）。2026-10-28 起 provider 已并进
 # config/agent.json 的 LLM_PROVIDERS 数组；此文件仅在从旧版升级时做一次性迁移读取。
 data/llm-providers.json
-data/state/llm-providers.json
 # 多搜索源配置（含 API key），运行期生成，绝不入库
 data/search-providers.json
 # 主动联系配置（含目标 QQ 号）与热点候选池状态，运行期生成，绝不入库
@@ -79,6 +78,22 @@ data/nudge.json
 data/nudge-hotspot.json
 # 2FA secret（TOTP 密钥），运行期生成，绝不入库
 data/2fa-secret.json
+# 重启回执与定时推送去重状态（含真实 QQ/群号），运行期生成，绝不入库
+data/reboot-notice.json
+data/push-state.json
+
+# compose 部署把上面这批 data/ 根状态文件**重定向**进 data/state/
+# （scripts/compose_init.py 的 STATE_REDIRECTS），该目录本身也在 DATA_DIRS 里。
+# 整目录忽略而不是逐个补：2026-10-28 做重定向时只补了 llm-providers.json 一行，
+# 另外 6 个（2fa-secret / search-providers / nudge / nudge-hotspot /
+# reboot-notice / push-state）连同下面两个目录全漏，compose/NAS 机器上
+# `git add -A` 会把 TOTP secret、搜索源 key 与真实 QQ 目标暂存进公开仓库。
+# 覆盖集合由 tests/test_repo_guards.py 从 STATE_REDIRECTS / DATA_DIRS 推导断言，
+# 新增状态文件不用再想起来补这一行。
+data/state/
+# 异地备份镜像暂存（pg_dump 明文，可达数 GB）与 SSH 只读诊断的 known_hosts/hosts
+data/mirror/
+data/ssh/
 
 # 人格：只跟踪仓库内置（assistant / fortune_teller），本地自定义一律不入库
 agentcore/personas/*.md
@@ -95,15 +110,18 @@ data/privacy/*
 data/budget/
 data/logs/
 
-# LLM 沙箱工作区（本地临时/缓存）
-# SOUL.md / personas/ / cron/ 是**配置**（OpenClaw 兼容），要入库——默认人格与
-# 定时任务随仓库走，换机器/重建镜像都有；其余运行期产物仍忽略。
-# 纪律：cron/ 入库内容只能是**模板**（占位号 + `group:<群号>` 字面量），真实任务与
-# 真实群号只写本机、不入库；scripts/check_privacy.py 是这条纪律的 CI 门禁。
+# LLM 沙箱工作区（本地临时/缓存）：整目录运行期，一律不入库。
+# 2026-10-29 起人格（data/personas）与定时任务（data/cron）已搬出沙箱写面，
+# workspace 里不再有需要入库的「配置」。
 data/workspace/*
-!data/workspace/SOUL.md
-!data/workspace/personas/
-!data/workspace/cron/
+
+# 人格目录：运行时配置，真实人格（可能含个人化正文）只写本机。
+# 默认人格模板在 agentcore/personas/templates/SOUL.md（随镜像/仓库走）。
+data/personas/*
+
+# 定时任务：运行时配置 + 运行状态 sidecar。模板见 docs/examples/cron-jobs.example.json。
+# 纪律：jobs.json 里的真实群号/QQ 号只写本机；scripts/check_privacy.py 是 CI 门禁。
+data/cron/*
 
 # 知识库样例语料（本地自备，一律不入库）
 data/kb_samples/*

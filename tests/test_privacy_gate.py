@@ -87,27 +87,35 @@ class TestRuleAHashes:
 class TestRuleBShape:
     def test_flags_9_to_11_digits_in_runtime_config(self):
         problems = cp.scan_text(
-            "data/workspace/cron/jobs.json", '{"to": "group:2900000456"}', set()
+            "docs/examples/cron-jobs.example.json", '{"to": "group:2900000456"}', set()
         )
         assert len(problems) == 1
-        assert "data/workspace/cron/jobs.json:1:" in problems[0]
+        assert "docs/examples/cron-jobs.example.json:1:" in problems[0]
         assert "2900000456" not in problems[0]
 
     def test_placeholder_group_in_template_is_allowed(self):
         """jobs.json 模板随仓库分发，占位号必须放行，否则门禁无法在自身上通过。"""
         text = '{"to": "group:123456789"}'
-        assert cp.scan_text("data/workspace/cron/jobs.json", text, set()) == []
+        assert cp.scan_text("docs/examples/cron-jobs.example.json", text, set()) == []
 
     def test_scope_is_narrow(self):
         """同一条 10 位数字写在文档里不触发规则 B（那是规则 A 的职责）。"""
         assert cp.scan_text("docs/x.md", "group:2900000456", set()) == []
         assert cp.scan_text("config/agent.json", '{"g": 2900000456}', set()) != []
 
+    def test_workspace_still_scanned(self):
+        """运行期目录也属于规则 B 的窄范围（旧路径不能因为模板搬走就漏检）。"""
+        assert cp.scan_text("data/workspace/notes.json", "2900000456", set()) != []
+
     def test_digit_length_bounds(self):
         # 8 位与 12 位都不在 9~11 区间（12 位是规则 A 的边界，不是规则 B 的）
-        assert cp.scan_text("data/workspace/cron/jobs.json", "12345678", set()) == []
         assert (
-            cp.scan_text("data/workspace/cron/jobs.json", "123456789012", set()) == []
+            cp.scan_text("docs/examples/cron-jobs.example.json", "12345678", set())
+            == []
+        )
+        assert (
+            cp.scan_text("docs/examples/cron-jobs.example.json", "123456789012", set())
+            == []
         )
 
 

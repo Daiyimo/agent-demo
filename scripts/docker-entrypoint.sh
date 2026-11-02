@@ -47,7 +47,7 @@ fi
 # 一次的成本是几次 stat。
 python /app/scripts/compose_init.py --bootstrap /app
 
-MOUNTS="logs archive backups budget workspace cache sessions privacy skills kb_samples state mirror ssh"
+MOUNTS="logs archive backups budget workspace cache sessions privacy skills kb_samples state mirror ssh cron personas"
 TOPDIRS="/app/config"
 FILES="/app/.env /app/config.yaml /app/config/agent.env /app/config/agent.json /app/config/config.yaml"
 

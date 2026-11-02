@@ -698,6 +698,49 @@ class TestReminderSkills:
         assert len(await store.schedule_list()) == 1
 
 
+class TestReminderEmptyUidRejected:
+    """上游 a9a28cf（REVIEW-63f9444..858afcc M1）回归：空会话不得借管理员哨兵越权。
+
+    ``store.schedule_list/schedule_cancel`` 的 ``user_id=None`` 是**管理员哨兵**
+    （两实现一致：None 时不加 WHERE 子句 / 不做属主校验，tests/test_store_contract.py
+    锁死）。skill 层以前用 ``user_id or None`` 把空串转成这个哨兵，于是漏传
+    user_id 的调用方（handler 默认值 ``""``）静默获得全量视图 + 跨用户取消。
+    现在入口显式拒绝，与 reminder_add_skill 同款。
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_uid_cannot_list_or_cancel_others(self):
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.skills.registry import SkillRegistry
+        from agentcore.skills.reminder_skills import register_reminder_skills
+
+        store = InMemoryMemoryStore()
+        reg = SkillRegistry()
+        register_reminder_skills(reg, store, _FakeSink())
+        for uid in ("10001", "10002"):
+            await reg.execute(
+                "reminder_add", user_id=uid, when="10分钟后", text=f"{uid}-secret"
+            )
+
+        # 空 uid：list 与 cancel 都在入口被拒，别人的提醒既看不到也取消不掉
+        assert await reg.execute("reminder_list", user_id="") == (
+            "错误：拿不到会话信息，无法查看提醒"
+        )
+        other_id = (await store.schedule_list("10002"))[0]["id"]
+        assert "拿不到会话信息" in await reg.execute(
+            "reminder_cancel", user_id="", schedule_id=other_id
+        )
+        # None 同样被拒：显式传 None 也不能落成管理员哨兵
+        assert "拿不到会话信息" in await reg.execute(
+            "reminder_cancel", user_id=None, schedule_id=other_id
+        )
+        left = await store.schedule_list("10002")
+        assert len(left) == 1 and left[0]["enabled"] is True
+        # 正常 user_id 仍只见自己（对照：拒绝不能误伤合法调用）
+        mine = await reg.execute("reminder_list", user_id="10001")
+        assert "10001-secret" in mine and "10002-secret" not in mine
+
+
 class TestReminderPushSeparation:
     """M7：提醒与定时内容推送共用 schedules 表，但两者不能互相串味。
 
@@ -736,15 +779,46 @@ class TestReminderPushSeparation:
         # 普通用户视角：推送任务不属于他，看不到也没法取消（行本身不受影响）
         answer = await reg.execute("reminder_cancel", user_id="7", schedule_id=push_id)
         assert "没找到" in answer
-        # 管理员视角（user_id 为空 = 全量列表）：明确提示走 /push 而不是提醒取消
-        admin_answer = await reg.execute(
+        # 上游 a9a28cf（REVIEW-63f9444..858afcc M1）回归：空 user_id 不能再
+        # 借 store 的 None 管理员哨兵拿全量视图，入口直接拒绝，推送任务也不受影响。
+        empty_answer = await reg.execute(
             "reminder_cancel", user_id="", schedule_id=push_id
         )
-        assert "/push off" in admin_answer
+        assert "拿不到会话信息" in empty_answer
+        assert await reg.execute("reminder_list", user_id="") == (
+            "错误：拿不到会话信息，无法查看提醒"
+        )
         push_rows = await store.schedule_list("__push__")
         assert push_rows and push_rows[0]["enabled"] is True, (
             "reminder_cancel 不得停用推送任务"
         )
+        # 同一 user_id 下既有提醒又有推送任务时（部署者与用户同号的极端情况），
+        # 取消动作仍必须指向 /push 而不是把推送任务关掉——这条真实意图以前靠
+        # 空 uid 的管理员全量视图才能触达，现在改由「行属于调用者自己」触达。
+        await store.schedule_add(
+            kind="cron",
+            target="group:1",
+            message="同号推送",
+            user_id="7",
+            cron="0 8 * * *",
+            next_run=1.0,
+            action="push",
+            params={"job_key": "同号", "prompt": "x", "template": "同号推送"},
+        )
+        own_push_id = next(
+            r["id"] for r in await store.schedule_list("7") if r.get("action") == "push"
+        )
+        own_answer = await reg.execute(
+            "reminder_cancel", user_id="7", schedule_id=own_push_id
+        )
+        assert "/push off" in own_answer
+        assert "已取消" not in own_answer
+        own_row = next(
+            r
+            for r in await store.schedule_list("7", include_disabled=True)
+            if str(r["id"]) == str(own_push_id)
+        )
+        assert own_row["enabled"] is True, "reminder_cancel 不得停用同号的推送任务"
 
     @pytest.mark.asyncio
     async def test_push_rows_do_not_eat_reminder_quota(self):

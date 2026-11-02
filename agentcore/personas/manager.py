@@ -3,16 +3,19 @@
 **布局**（与 OpenClaw / picoclaw 的 workspace 约定一致，靠**文件位置**标识人格，
 不再用 frontmatter——OpenClaw 的 SOUL.md 是纯 markdown，加 frontmatter 会破坏互通）::
 
-    data/workspace/                 ← PERSONAS_DIR，容器内 /app/data/workspace
+    data/personas/                  ← PERSONAS_DIR，容器内 /app/data/personas
     ├── SOUL.md                     ← 默认人格（根级，无 frontmatter）
-    └── personas/
-        ├── aemeath/SOUL.md         ← 可切换人格，**目录名 = 人格名**
-        └── <name>/SOUL.md
-        └── <name>/ABOUT.txt        ← 可选，web「人格」页的描述来源
+    ├── aemeath/SOUL.md             ← 可切换人格，**目录名 = 人格名**
+    ├── <name>/SOUL.md
+    └── <name>/ABOUT.txt            ← 可选，web「人格」页的描述来源
 
-默认目录从本模块所在目录（旧的 ``agentcore/personas/``）改为 **``data/workspace``**
-（相对 CWD 解析）：那才是 compose 挂载出去的目录，用户改文件即生效，不必重建镜像。
+2026-10-29 起人格从 ``data/workspace`` 搬出到 **``data/personas``**：workspace 是 LLM
+沙箱的可写区（fs_write 能落盘），人格放在里面等于让人格文件与临时产物共用一个写面，
+一条提示注入就能改人格。搬出后 ``WorkspaceFS`` 把 ``personas/`` 列为保留名直接拒写。
 ``PERSONAS_DIR`` 仍可覆盖（容器外部署 / 测试）。
+
+**旧布局兼容**：迁移是「复制不搬」，旧位 ``data/workspace/personas/<name>/SOUL.md``
+仍会被读到（见 :meth:`PersonaManager._persona_bases`），避免升级后人格突然消失。
 """
 
 from __future__ import annotations
@@ -27,9 +30,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# 相对 CWD：容器内 WORKDIR 是 /app，即 /app/data/workspace（compose 已挂载）。
+# 相对 CWD：容器内 WORKDIR 是 /app，即 /app/data/personas（compose 已挂载）。
 # 不用 Path(__file__).parent——那是镜像里的 agentcore/personas，用户改不到。
-DEFAULT_PERSONAS_DIR = Path("data/workspace")
+DEFAULT_PERSONAS_DIR = Path("data/personas")
 
 # 目录名会进 /persona use <name> 与 web URL，必须挡掉路径穿越与空白。
 # 比旧的 _NAME_RE 宽松：允许中文等 unicode 字母数字（OpenClaw 的 workspace 名不限 ASCII），
@@ -209,26 +212,59 @@ class PersonaManager:
             if p is not None:
                 personas["default"] = p
 
-        sub = self.dir / _PERSONAS_SUBDIR
-        if not sub.is_dir():
-            return personas
-        for child in sorted(sub.iterdir()):
-            if not child.is_dir():
+        for base in self._persona_bases():
+            if not base.is_dir():
                 continue
-            name = child.name
-            if not valid_persona_name(name):
-                self._warn_once(
-                    ("badname", name), "persona dir name %r invalid, skipped", name
-                )
-                continue
-            soul = child / _SOUL_FILENAME
-            if not soul.is_file():
-                # 没有 SOUL.md 的目录不是人格（可能是用户放素材的地方），静默跳过
-                continue
-            p = self._load_one(name, soul, default=False)
-            if p is not None:
-                personas[name] = p
+            for child in sorted(base.iterdir()):
+                if not child.is_dir():
+                    continue
+                name = child.name
+                if not valid_persona_name(name):
+                    self._warn_once(
+                        ("badname", name), "persona dir name %r invalid, skipped", name
+                    )
+                    continue
+                if name in personas:
+                    # 新位与旧位同名：新位优先，旧位是迁移前的残留副本
+                    continue
+                soul = child / _SOUL_FILENAME
+                if not soul.is_file():
+                    # 没有 SOUL.md 的目录不是人格（可能是用户放素材的地方），静默跳过
+                    continue
+                p = self._load_one(name, soul, default=False)
+                if p is not None:
+                    personas[name] = p
         return personas
+
+    def _persona_bases(self) -> builtins.list[Path]:
+        """人格目录可能落在的位置（新位优先）。
+
+        新布局 ``data/personas/<name>/``；旧布局（``PERSONAS_DIR`` 指向 workspace 的
+        部署，或升级后尚未迁移）是 ``data/workspace/personas/<name>/``。迁移按
+        「复制不搬」执行，于是两处会同时存在——新位优先，旧位只作为读回退。
+        """
+        bases = [self.dir]
+        legacy = self.dir / _PERSONAS_SUBDIR
+        if legacy.is_dir():
+            bases.append(legacy)
+        return bases
+
+    def _write_base(self) -> Path:
+        """写面落点。
+
+        默认新位（``data/personas``）直接就是人格根：``<名字>/SOUL.md`` 与根级
+        ``SOUL.md`` 并列。显式 ``PERSONAS_DIR`` 的部署（容器外自定义目录、老的
+        workspace 布局、既有测试）沿用升级前的语义——人格在 ``personas/`` 子目录下，
+        否则老用户升级后写进去的文件读不到（升级前的写面就是 ``dir/personas``）。
+        """
+        if self.dir == DEFAULT_PERSONAS_DIR.resolve():
+            return self.dir
+        return self.dir / _PERSONAS_SUBDIR
+
+    @property
+    def write_root(self) -> Path:
+        """人格文件的实际落点（旧布局是 ``personas/`` 子目录）；迁移/部署脚本用。"""
+        return self._write_base()
 
     # ---------------------------------------------------------------- 查询
 
@@ -307,7 +343,7 @@ class PersonaManager:
             raise ValueError("persona name 'default' is reserved for root SOUL.md")
         body_text = render_soul_md(body)
         about_text = render_about(description)
-        target = self.dir / _PERSONAS_SUBDIR / name
+        target = self._write_base() / name
         target.mkdir(parents=True, exist_ok=True)
         self._atomic_write(target / _SOUL_FILENAME, body_text)
         if about_text:
@@ -354,7 +390,11 @@ class PersonaManager:
         name = (name or "").strip()
         if not valid_persona_name(name):
             raise ValueError(f"invalid persona name: {name!r}")
-        target = self.dir / _PERSONAS_SUBDIR / name
+        target = self._write_base() / name
+        if not target.is_dir():
+            # 旧位残留（升级后新位还没写过）：删旧位，别让「删了又自己回来」
+            legacy = self.dir / _PERSONAS_SUBDIR / name
+            target = legacy if legacy.is_dir() else target
         if not target.is_dir():
             return False
         # 只删这两个本机制生成的文件，不 rmtree——用户可能往目录里放了别的东西

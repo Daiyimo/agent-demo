@@ -65,7 +65,9 @@ class TestPermissionChecker:
             group_skills={"123": {"search_web", "calc"}},
             default_permission="public",
         )
-        assert checker.is_allowed("search_web", "222", "123") is True
+        # 群授权只在访客面上生效：技能必须显式 guest=True（D1，fail-closed）
+        assert checker.is_allowed("search_web", "222", "123", guest=True) is True
+        assert checker.is_allowed("search_web", "222", "123") is False
 
     def test_group_skill_denied_for_private(self):
         checker = PermissionChecker(
@@ -112,6 +114,91 @@ class TestPermissionChecker:
     def test_empty_superusers_denies_private(self):
         checker = PermissionChecker(superusers=set(), default_permission="private")
         assert checker.is_allowed("secret_skill", "222", None) is False
+
+
+class TestGroupTrustModel:
+    """D1（信任模型）：群聊是多人场合，schema 披露即泄漏。
+
+    群内 superuser 只保留非 superuser 面 + 显式登记的**只读**额外技能；
+    群内非 superuser 只逛访客面（``guest=True``）；私聊语义不变。
+    """
+
+    def test_group_superuser_keeps_public_surface(self):
+        checker = PermissionChecker(superusers={"111"})
+        assert checker.is_allowed("calc", "111", "123", "public") is True
+
+    def test_group_superuser_loses_superuser_skills(self):
+        checker = PermissionChecker(superusers={"111"})
+        assert (
+            checker.is_allowed("fs_write", "111", "123", "superuser", read_only=False)
+            is False
+        )
+
+    def test_group_extra_only_applies_to_readonly(self):
+        checker = PermissionChecker(
+            superusers={"111"}, group_extra_skills={"system_status", "fs_write"}
+        )
+        assert (
+            checker.is_allowed(
+                "system_status", "111", "123", "superuser", read_only=True
+            )
+            is True
+        )
+        # 写面技能即便写进 extra 也不放行（extra 不是绕过权限的通道）
+        assert (
+            checker.is_allowed("fs_write", "111", "123", "superuser", read_only=False)
+            is False
+        )
+
+    def test_group_extra_not_a_superuser_upgrade(self):
+        """extra 只放宽群内 superuser 的**只读**面，不会让普通群成员看到它。"""
+        checker = PermissionChecker(
+            superusers={"111"}, group_extra_skills={"system_status"}
+        )
+        assert (
+            checker.is_allowed(
+                "system_status", "222", "123", "superuser", read_only=True, guest=True
+            )
+            is False
+        )
+
+    def test_private_superuser_keeps_full_surface(self):
+        checker = PermissionChecker(
+            superusers={"111"}, group_extra_skills={"system_status"}
+        )
+        assert (
+            checker.is_allowed("fs_write", "111", None, "superuser", read_only=False)
+            is True
+        )
+
+    def test_group_guest_sees_only_guest_marked(self):
+        checker = PermissionChecker(superusers={"111"})
+        assert checker.is_allowed("calc", "222", "123", "public", guest=True) is True
+        # 未标 guest 的 public 技能对群内普通成员不可见（fail-closed）
+        assert checker.is_allowed("fetch_url", "222", "123", "public") is False
+        assert (
+            checker.is_allowed(
+                "calc", "222", "123", "superuser", read_only=True, guest=True
+            )
+            is False
+        )
+
+    def test_group_guest_respects_group_grant(self):
+        checker = PermissionChecker(
+            superusers=set(), group_skills={"123": {"play_music"}}
+        )
+        assert (
+            checker.is_allowed("play_music", "222", "123", "restricted", guest=True)
+            is True
+        )
+        assert (
+            checker.is_allowed("play_music", "222", "456", "restricted", guest=True)
+            is False
+        )
+
+    def test_private_non_superuser_unchanged(self):
+        checker = PermissionChecker(superusers=set())
+        assert checker.is_allowed("calc", "222", None, "public", guest=True) is True
 
 
 class TestSuperuserEnvLayer:

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import re
 from pathlib import Path
 
 from agentcore import tz
@@ -10,6 +11,7 @@ from agentcore import tz
 # 进程内诊断事件（web 总览「最近事件」面板的数据源）；纯标量摘要，不带用户内容
 from agentcore.boolenv import env_bool
 from agentcore.diagnostics import record as _diag_record
+from agentcore.migrate_layout import migrate_legacy_layout
 
 logger = logging.getLogger(__name__)
 
@@ -403,6 +405,41 @@ async def _init_group_archive(db_url: str):
     return store, buffer
 
 
+def _group_extra_skills() -> set[str]:
+    """解析 ``AGENT_GROUP_EXTRA_SKILLS``：群内 superuser 额外可见的**只读**技能。
+
+    逗号/分号/空白分隔，名字大小写敏感（与注册名一致）。只读与存在性在
+    ``_validate_group_extra_skills`` 里于**全部注册完成后**校验——技能可能
+    条件注册（搜索/点歌/统计按 env 开关），启动早期校验会误报未知。
+    """
+    raw = os.getenv("AGENT_GROUP_EXTRA_SKILLS", "")
+    return {p for p in re.split(r"[,;\s]+", raw) if p}
+
+
+def _validate_group_extra_skills(skill_registry) -> None:
+    """校验群内 extra 白名单：未知 / 非只读都告警并**不生效**（fail-closed）。"""
+    for name in sorted(_group_extra_skills()):
+        skill = skill_registry.skills.get(name)
+        if skill is None:
+            logger.warning(
+                "AGENT_GROUP_EXTRA_SKILLS 含未知技能 %r：拼写错误或该功能未启用，"
+                "该项不会生效（群内 superuser 看不到它）",
+                name,
+            )
+        elif not skill.read_only:
+            logger.warning(
+                "AGENT_GROUP_EXTRA_SKILLS 含非只读技能 %r：群内只允许暴露只读工具，"
+                "该项被忽略（如确属只读，先加进 builtin 的 mark_read_only 名单）",
+                name,
+            )
+        elif skill.permission != "superuser":
+            logger.info(
+                "AGENT_GROUP_EXTRA_SKILLS 的 %r 不是 superuser 级：群内本来就可见，"
+                "该配置项冗余",
+                name,
+            )
+
+
 def _build_skill_registry(CONFIG: dict):
     """装配技能注册表（权限/内置/点歌/本地/安装型），返回真实实例。"""
     from agentcore.skills.builtin import register_builtin_skills
@@ -424,6 +461,7 @@ def _build_skill_registry(CONFIG: dict):
         group_skills=_merge_music_group_grants({}),
         user_skills={},
         default_permission=skill_default,
+        group_extra_skills=_group_extra_skills(),
     )
 
     skill_registry = SkillRegistry(permission_checker=checker)
@@ -703,8 +741,9 @@ async def _build_nudge(memory, sink, engine, scheduler, CONFIG):
 def _build_cron_jobs(engine, sink, scheduler):
     """jobs.json 定时任务（OpenClaw 兼容）：到点让 agent 跑一轮并投递到指定会话。
 
-    落点 ``data/workspace/cron/jobs.json``（容器内即 /app/data/workspace/cron，
-    compose 已挂 data/workspace）。只接管 ``payload.kind == "agent_turn"``——
+    落点 ``data/cron/jobs.json``（容器内即 /app/data/cron，compose 已挂；
+    ``AGENT_CRON_DIR`` 可覆盖）。运行状态在同目录 ``state.json``。
+    只接管 ``payload.kind == "agent_turn"``——
     kb_digest / db_backup / 群统计 / 提醒轮询仍是系统运维任务，继续走 env
     （用 agent_turn 间接表达它们只会更脆：多一层 LLM 依赖，失败时连备份都不做）。
 
@@ -713,8 +752,19 @@ def _build_cron_jobs(engine, sink, scheduler):
     坏文件只告警不阻塞启动（定时任务是增益功能，不是关键路径）。
     """
     from agentcore.scheduler.agent_turn import AgentTurnRunner
+    from agentcore.scheduler.jobs import jobs_path
 
-    runner = AgentTurnRunner(engine, sink, scheduler=scheduler)
+    # 群目标 ACL 与主聊天/push 同一套白名单：不在 ALLOWED_GROUPS 的群不跑引擎、
+    # 不投递（agentcore 不 import plugins，白名单从这里注入）。
+    from .acl import ALLOWED_GROUPS
+
+    runner = AgentTurnRunner(
+        engine,
+        sink,
+        scheduler=scheduler,
+        allowed_groups=ALLOWED_GROUPS,
+        jobs_file=jobs_path(),
+    )
     if not runner.register():
         return None
     jobs, errors = _cron_jobs_snapshot()
@@ -749,7 +799,7 @@ def _cron_jobs_dir() -> str:
 
         return str(cron_dir())
     except Exception:  # pragma: no cover - 导入失败不该影响启动
-        return "data/workspace/cron"
+        return "data/cron"
 
 
 def _register_backup_jobs(scheduler, archive, backup_cfg):
@@ -1057,11 +1107,19 @@ else:
             scheduler, stats_collector, stats_route, archive_buffer
         )
 
+        # 旧布局（data/workspace/{cron,personas,SOUL.md}）先复制到新位置：
+        # 必须早于 _build_cron_jobs 读文件；幂等、失败只 WARNING（不影响启动）。
+        migrate_legacy_layout()
+
         push = await _build_push(memory, sink, llm, scheduler, CONFIG)
 
         nudge = await _build_nudge(memory, sink, engine, scheduler, CONFIG)
 
         _build_cron_jobs(engine, sink, scheduler)
+
+        # 群内 extra 技能白名单：全部注册（builtin/安装型/本地/点歌/统计）完成后
+        # 才校验——条件注册的技能此刻才确定存在。
+        _validate_group_extra_skills(skill_registry)
 
         _register_backup_jobs(scheduler, archive, backup_cfg)
 

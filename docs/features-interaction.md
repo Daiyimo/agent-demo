@@ -22,11 +22,12 @@
 
 ## 人格系统（Persona）
 
-**2026-10-28 起改为 OpenClaw 兼容的 SOUL.md 布局**：`data/workspace/` 下靠**文件位置**标识人格，
+**2026-10-28 起改为 OpenClaw 兼容的 SOUL.md 布局；2026-10-29 从 `data/workspace/` 搬到
+`data/personas/`**（workspace 是 LLM 沙箱可写面，提示注入本可改人格），靠**文件位置**标识人格，
 纯 markdown、**无 frontmatter**（OpenClaw 的 SOUL.md 就是纯 md，加 frontmatter 会破坏两边互拷）：
 
 ```
-data/workspace/                  ← PERSONAS_DIR 可覆盖；容器内 /app/data/workspace（compose 已挂载）
+data/personas/                  ← PERSONAS_DIR 可覆盖；容器内 /app/data/personas（compose 已单独挂载）
 ├── SOUL.md                      ← 默认人格（根级，人格名固定 "default"）
 └── personas/
     ├── fortune_teller/SOUL.md   ← 可切换人格，目录名 = 人格名（中文目录名也可用）

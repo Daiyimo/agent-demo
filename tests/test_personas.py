@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from agentcore.memory.store import InMemoryMemoryStore
-from agentcore.personas import PersonaManager
+from agentcore.personas import DEFAULT_PERSONAS_DIR, PersonaManager
 from agentcore.personas.manager import (
     _BODY_MAX,
     _DESCRIPTION_MAX,
@@ -441,3 +441,66 @@ class TestPersonaSaveDelete:
         assert pm.default().name == "mine"
         pm.delete("mine")
         assert pm.default().name == "default"
+
+
+class TestPersonaOutOfWorkspace:
+    """2026-10-29：人格搬出 ``data/workspace``（LLM 沙箱写面）到 ``data/personas``。
+
+    变异锚点：默认目录退回 workspace、或去掉旧位读回退，本类必须红。
+    """
+
+    @staticmethod
+    def _soul(title: str, body: str) -> str:
+        nl = chr(10)
+        return f"# {title}{nl}{body}{nl}"
+
+    def test_default_dir_is_outside_workspace(self):
+        assert DEFAULT_PERSONAS_DIR == Path("data/personas")
+        # 沙箱工作区是 data/workspace——人格目录不能落在它里面
+        assert "workspace" not in DEFAULT_PERSONAS_DIR.parts
+
+    def test_legacy_personas_subdir_still_read(self, tmp_path):
+        (tmp_path / "SOUL.md").write_text(
+            self._soul("默认", "默认正文"), encoding="utf-8"
+        )
+        legacy = tmp_path / "personas" / "old"
+        legacy.mkdir(parents=True)
+        (legacy / "SOUL.md").write_text(
+            self._soul("旧人格", "旧正文"), encoding="utf-8"
+        )
+        pm = PersonaManager(tmp_path)
+        assert "old" in [p.name for p in pm.list()]
+        assert "旧正文" in pm.get("old").body
+
+    def test_new_layout_wins_over_legacy_copy(self, tmp_path):
+        (tmp_path / "SOUL.md").write_text(
+            self._soul("默认", "默认正文"), encoding="utf-8"
+        )
+        new = tmp_path / "dup"
+        new.mkdir()
+        (new / "SOUL.md").write_text(self._soul("新", "新正文"), encoding="utf-8")
+        old = tmp_path / "personas" / "dup"
+        old.mkdir(parents=True)
+        (old / "SOUL.md").write_text(self._soul("旧", "旧正文"), encoding="utf-8")
+        pm = PersonaManager(tmp_path)
+        assert "新正文" in pm.get("dup").body
+
+    def test_default_layout_writes_flat(self, tmp_path, monkeypatch):
+        """默认新位 ``data/personas`` 没有人格子目录这一层：``<名字>/SOUL.md`` 直接并列。"""
+        from agentcore.personas import manager as M
+
+        monkeypatch.delenv("PERSONAS_DIR", raising=False)
+        root = tmp_path / "data" / "personas"
+        root.mkdir(parents=True)
+        monkeypatch.setattr(M, "DEFAULT_PERSONAS_DIR", root)
+        pm = M.PersonaManager()
+        pm.save("flat", body="x")
+        assert (root / "flat" / "SOUL.md").is_file()
+        assert not (root / "personas").exists()
+
+    def test_explicit_legacy_dir_still_writes_into_personas_subdir(self, tmp_path):
+        """``PERSONAS_DIR`` 指向旧 workspace 布局的部署：写面继续落在 personas/。"""
+        (tmp_path / "personas").mkdir()
+        pm = PersonaManager(tmp_path)
+        pm.save("mine", body="x")
+        assert (tmp_path / "personas" / "mine" / "SOUL.md").is_file()

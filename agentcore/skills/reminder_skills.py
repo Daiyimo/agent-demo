@@ -52,6 +52,7 @@ def register_reminder_skills(registry, store, sink) -> None:
             "required": ["when", "text"],
         },
         permission="public",
+        guest=True,
     )
     async def reminder_add_skill(
         when: str, text: str, user_id: str = "", group_id: str | None = None
@@ -91,10 +92,19 @@ def register_reminder_skills(registry, store, sink) -> None:
         "查看当前还没有触发的提醒（含一次性与周期提醒）。",
         {"type": "object", "properties": {}},
         permission="public",
+        guest=True,
     )
     async def reminder_list_skill(user_id: str = "") -> str:
-        rows = _remind_rows(await store.schedule_list(user_id or None))
-        rows = [r for r in rows if not user_id or r["user_id"] == user_id]
+        # 上游 a9a28cf（REVIEW-63f9444..858afcc M1）：`user_id or None` 会把空会话
+        # 落成 store 的管理员哨兵 None——schedule_list(None) 取全量，于是列出
+        # **所有用户**的提醒正文。registry.execute 是公开 API，任何新调用方漏传
+        # user_id（handler 默认值 `""` 生效）即静默获得跨用户视图；引擎主链路
+        # 虽恒非空（engine.py:1072 `context.get("user_id", "unknown")`），这个
+        # 口子不该靠"调用方恰好都传了"来守。与 reminder_add_skill 同款入口拒绝。
+        if not user_id:
+            return "错误：拿不到会话信息，无法查看提醒"
+        rows = _remind_rows(await store.schedule_list(user_id))
+        rows = [r for r in rows if r["user_id"] == user_id]
         if not rows:
             return "当前没有待触发的提醒。"
         lines = [f"待触发提醒（{len(rows)} 条）："]
@@ -116,9 +126,15 @@ def register_reminder_skills(registry, store, sink) -> None:
             "required": ["schedule_id"],
         },
         permission="public",
+        guest=True,
     )
     async def reminder_cancel_skill(schedule_id: str, user_id: str = "") -> str:
-        uid = user_id or None
+        # 同上（M1）：空 user_id 落成 None 管理员哨兵后，schedule_cancel 的
+        # `user_id is None or row["user_id"] == user_id` 判真 → 可取消**别人**的
+        # 提醒。store 的 None 语义是"管理员操作"，不是"匿名调用方"。
+        if not user_id:
+            return "错误：拿不到会话信息，无法取消提醒"
+        uid = user_id
         rows = await store.schedule_list(uid, include_disabled=True)
         row = next((r for r in rows if str(r["id"]) == str(schedule_id)), None)
         if row is not None and (row.get("action") or "remind") != "remind":

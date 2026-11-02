@@ -300,6 +300,7 @@ class TestBootstrap:
             "json": "created",
             "web_env": "created",
             "soul": "created",
+            "cron": "created",
             "data": "created",
         }
         # config.yaml 必须原样复制镜像内那份——改内容等于偷偷改引擎配置
@@ -313,26 +314,48 @@ class TestBootstrap:
         assert sorted(p.name for p in (app / "data").iterdir()) == sorted(ci.DATA_DIRS)
 
     def test_soul_md_bootstrapped_from_package_template(self, tmp_path):
-        """默认人格必须由自举落进挂载的 data/workspace/。
+        """默认人格必须由自举落进挂载的 data/personas/。
 
-        模板放在**包内**（agentcore/personas/templates/）而不是 data/workspace/ 本身：
+        模板放在**包内**（agentcore/personas/templates/）而不是 data/personas/ 本身：
         后者是 compose 挂载点，镜像里那份会被宿主空目录整体遮掉，首启就没人写默认人格。
         """
         app = self._app_root(tmp_path)
 
         ci.bootstrap(app)
 
-        soul = app / "data" / "workspace" / "SOUL.md"
+        soul = app / "data" / "personas" / "SOUL.md"
         assert soul.is_file()
         assert (
             soul.read_bytes()
             == (ROOT / "agentcore" / "personas" / "templates" / "SOUL.md").read_bytes()
         )
 
+    def test_cron_template_bootstrapped(self, tmp_path):
+        """首启放一份 jobs.json 模板（enabled:false），真实群号不得入库。"""
+        app = self._app_root(tmp_path)
+
+        ci.bootstrap(app)
+
+        jobs = json.loads((app / "data" / "cron" / "jobs.json").read_text("utf-8"))
+        assert jobs["jobs"], "模板至少要有一条"
+        assert all(j["enabled"] is False for j in jobs["jobs"])
+        assert all("state" not in j for j in jobs["jobs"])
+
+    def test_existing_cron_jobs_is_never_overwritten(self, tmp_path):
+        app = self._app_root(tmp_path)
+        mine = app / "data" / "cron" / "jobs.json"
+        mine.parent.mkdir(parents=True)
+        mine.write_text('{"version": 1, "jobs": []}', encoding="utf-8")
+
+        report = ci.bootstrap(app)
+
+        assert report["cron"] == "kept"
+        assert json.loads(mine.read_text("utf-8"))["jobs"] == []
+
     def test_existing_soul_md_is_never_overwritten(self, tmp_path):
         """用户改过的人格是配置，自举不许覆盖（与 agent.json 同一契约）。"""
         app = self._app_root(tmp_path)
-        mine = app / "data" / "workspace" / "SOUL.md"
+        mine = app / "data" / "personas" / "SOUL.md"
         mine.parent.mkdir(parents=True)
         mine.write_text("我自己的爱弥斯人格\n", encoding="utf-8")
 
@@ -446,12 +469,85 @@ class TestRealTemplate:
         assert (ROOT / "config.yaml").is_file()
 
     def test_data_dirs_match_compose_mounts(self):
-        """DATA_DIRS 与 compose 的挂载表必须一致，漏一个该目录就不落盘。"""
-        compose = (ROOT / "docs" / "deploy-nas" / "docker-compose.yml").read_text(
-            encoding="utf-8"
+        """DATA_DIRS 与**两份** compose 的挂载表必须一致，漏一个该目录就不落盘。
+
+        2026-10-29：此前只查 docs/deploy-nas 那份，根目录 docker-compose.yml 漏挂
+        新目录也全绿（cron/personas 搬出来后正是这个坑）。
+        """
+        files = [
+            ROOT / "docker-compose.yml",
+            ROOT / "docs" / "deploy-nas" / "docker-compose.yml",
+        ]
+        for f in files:
+            compose = f.read_text(encoding="utf-8")
+            for name in ci.DATA_DIRS:
+                assert f"/app/data/{name}" in compose, (
+                    f"{f.name} 里没有挂 /app/data/{name}"
+                )
+
+    def test_dockerfile_ships_cron_template_and_runtime_dirs(self):
+        """镜像内必须建好 data/cron、data/personas，并带上 jobs.json 模板。
+
+        漏了 mkdir：首次启动 compose_init 会自己建（能跑），但容器内非 root 用户的
+        属权检查会告警；漏了 COPY：模板找不到，bootstrap 只能写一个空 jobs.json。
+        """
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        assert "data/cron" in dockerfile and "data/personas" in dockerfile
+        assert "docs/examples/cron-jobs.example.json" in dockerfile
+
+    def test_state_redirects_covered_by_gitignore(self):
+        """STATE_REDIRECTS 的每个落点都必须被 .gitignore 覆盖（2026-11-02 架构评审）。
+
+        2026-10-28 做 compose 重定向时只补了 ``data/state/llm-providers.json``
+        一行，另外 6 个（2fa-secret / search-providers / nudge / nudge-hotspot /
+        reboot-notice / push-state）连同 ``data/mirror``、``data/ssh`` 两个目录全漏——
+        NAS 机器上 ``git add -A`` 会把 TOTP secret、搜索源 API key、真实 QQ 目标
+        暂存进**公开**仓库，而这类泄漏只能靠重写全历史补救（AGENTS.md §5）。
+
+        落点集合从 ``STATE_REDIRECTS`` 推导：以后新增状态文件不用再想起来补
+        .gitignore（"想起来补一行"正是上次漏 7 个的原因）。
+        """
+        ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        patterns = [
+            line.strip().rstrip("/")
+            for line in ignore.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+        def covered(rel: str) -> bool:
+            tail = rel.rsplit("/", 1)[-1]
+            return any(
+                pat == rel
+                or pat == tail
+                or pat == f"/{rel}"
+                or pat.endswith(f"*/{rel}")
+                # 目录前缀：``data/state/`` 必须盖住 ``data/state/2fa-secret.json``
+                or rel.startswith(pat + "/")
+                for pat in patterns
+            )
+
+        missing = [
+            f"{env}={path}"
+            for env, path in ci.STATE_REDIRECTS.items()
+            if not covered(path)
+        ]
+        # 非 compose 部署的同名文件仍落在 data/ 根，同样必须覆盖
+        missing += [
+            f"data/{name}"
+            for name in (p.rsplit("/", 1)[-1] for p in ci.STATE_REDIRECTS.values())
+            if not covered(f"data/{name}")
+        ]
+        # 装着 pg_dump 镜像的暂存区与 SSH known_hosts（含主机指纹/私网地址）
+        missing += [
+            f"data/{name}/"
+            for name in ("mirror", "ssh")
+            if not covered(f"data/{name}/x")
+        ]
+        assert not missing, (
+            f"这些持凭据/含隐私的运行期产物没进 .gitignore：{missing}——"
+            "提交进去等于公开 TOTP secret / 搜索源 key / 真实 QQ 号，"
+            "只能靠 filter-repo 重写全历史补救"
         )
-        for name in ci.DATA_DIRS:
-            assert f"/app/data/{name}" in compose, f"compose 里没有挂 /app/data/{name}"
 
 
 # ---- 变异复核（2026-10-28）----
@@ -466,3 +562,4 @@ class TestRealTemplate:
 # 6. 少生成某个状态重定向键 → test_state_redirects_all_present 红
 # 7. DATA_DIRS 与 compose 挂载表漂移 → test_data_dirs_match_compose_mounts 红
 # 8. missing_keys 不识别「换成」占位 → test_placeholder_and_empty_count_as_missing 红
+# 9. 删掉 .gitignore 的 data/state/ 一行 → test_state_redirects_covered_by_gitignore 红

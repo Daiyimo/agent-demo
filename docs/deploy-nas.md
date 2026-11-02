@@ -208,6 +208,8 @@ services:
       - ./data/backups:/app/data/backups
       - ./data/budget:/app/data/budget
       - ./data/workspace:/app/data/workspace
+      - ./data/cron:/app/data/cron
+      - ./data/personas:/app/data/personas
       - ./data/cache:/app/data/cache
       - ./data/sessions:/app/data/sessions
       - ./data/privacy:/app/data/privacy

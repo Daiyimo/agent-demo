@@ -16,7 +16,7 @@
   哈希与真实值不同，零误报。
 * **规则 B（形态检查，窄范围）**：``data/workspace/**`` 与 ``config/**`` 是运行期
   配置，入库内容只能是模板——出现 9~11 位连续数字即失败，唯一例外是仓库通用占位号
-  （``PLACEHOLDER_TOKENS``，例如 ``data/workspace/cron/jobs.json`` 模板里的
+  （``PLACEHOLDER_TOKENS``，例如 ``docs/examples/cron-jobs.example.json`` 模板里的
   ``group:123456789``）。范围窄是刻意的：文档与测试里合法的长数字（时间戳、
   十进制 IP 的 SSRF 用例）不该被这条误伤。
 
@@ -42,13 +42,13 @@ REAL_IDS_FILE = PRIVACY_DIR / "real-ids.txt"
 _TOKEN_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b|\b\d{5,12}\b")
 # 规则 B：运行期配置里只允许模板，9~11 位连续数字一律视为真实群号 / QQ 号。
 _SHAPE_RE = re.compile(r"\b\d{9,11}\b")
-_SHAPE_SCOPES = ("data/workspace/", "config/")
+_SHAPE_SCOPES = ("data/workspace/", "config/", "docs/examples/")
 
 # 仓库通用占位号（AGENTS.md §4 的脱敏纪律）：与真实号段的取值域刻意重叠，靠
 # 「只在窄范围生效 + 显式白名单」区分。新增占位号要同时改这里与文档，别偷偷放行。
 PLACEHOLDER_TOKENS = frozenset(
     {
-        "123456789",  # data/workspace/cron/jobs.json 模板的 group:<占位号>
+        "123456789",  # docs/examples/cron-jobs.example.json 模板的 group:<占位号>
         "13800138000",  # 通用假手机号
         "1000000000",
         "0123456789",

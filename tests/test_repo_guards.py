@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -524,4 +525,45 @@ class TestConftestEnvHygiene:
             "测试进程 environ 含 DATABASE_URL（生产连接串）——conftest 的 "
             "_strip_prod_database_url 夹具被移除或失效；PG 用例请改用 "
             "TEST_DATABASE_URL，个别用例需要 DATABASE_URL 请显式 setenv"
+        )
+
+
+class TestRuntimeDataNotTracked:
+    """D6：工作区/人格/定时任务都是运行期数据，一个都不许进 git（2026-10-29）。
+
+    ``data/workspace`` 是 LLM 可写面、``data/personas``/``data/cron`` 是 owner 手写配置，
+    三者都可能含真实 QQ 号/群号/个人化正文。模板只允许放 ``docs/examples/``。
+    """
+
+    @staticmethod
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    def test_runtime_data_dirs_have_no_tracked_files(self):
+        r = self._git("ls-files", "data/workspace", "data/cron", "data/personas")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "", f"运行期数据不得入库：{r.stdout}"
+
+    def test_runtime_paths_are_ignored(self):
+        paths = [
+            "data/workspace/SOUL.md",
+            "data/cron/jobs.json",
+            "data/cron/state.json",
+            "data/personas/me/SOUL.md",
+        ]
+        r = self._git("check-ignore", *paths)
+        assert r.returncode == 0, "这些运行期路径必须被 .gitignore 忽略"
+        assert len(r.stdout.splitlines()) == len(paths)
+
+    def test_cron_template_is_tracked(self):
+        r = self._git("ls-files", "docs/examples/cron-jobs.example.json")
+        assert r.stdout.strip() == "docs/examples/cron-jobs.example.json", (
+            "模板必须入库，否则新部署拿不到样例（运行期副本在 data/cron/）"
         )

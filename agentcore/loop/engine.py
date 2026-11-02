@@ -109,6 +109,16 @@ _UNTRUSTED_TOOL_RESULTS = frozenset(
         "log_tail",
         "docker_logs",
         "docker_stats",
+        # 宿主机只读状态族（ops_skills.py:188/212/227/244 与 system_status.py:87
+        # 注册）：ps 输出含进程 argv、systemctl status 含 unit Description、
+        # netstat/ss 含对端地址——都能被主机侧文本影响而夹带提示注入，与
+        # log_tail/docker_logs 同一性质。仅 superuser 可见，故不是高危，但
+        # 未围栏直达的正是持有 proc_kill/run_shell/fs_delete 的工具循环。
+        "system_status",
+        "proc_detail",
+        "disk_usage",
+        "port_check",
+        "service_status",
     }
 )
 
@@ -1231,6 +1241,8 @@ class AgentEngine:
         session_id: str,
         user_message: str,
         extraction_text: str | None,
+        *,
+        isolated: bool = False,
     ) -> tuple[list[dict], str, str, str]:
         """事实抽取 + 并发召回（facts/人格/成长/KB），返回 prompt 所需的四块文本。"""
         # M4：先抽取并保存用户消息中的长期事实（静默、失败不影响对话）；
@@ -1260,7 +1272,9 @@ class AgentEngine:
                 logger.exception("query embedding failed")
                 query_embedding = None
         if has_text:
-            if (extract_source or "").strip():
+            # 隔离会话（cron agent_turn）不抽事实：换会话键只是把记忆写到另一个
+            # 名字下，抽取本身仍在跑；要真的「不留痕」必须在这里关掉。
+            if (extract_source or "").strip() and not isolated:
                 await self._remember_facts(
                     user_id,
                     session_id,
@@ -1351,6 +1365,9 @@ class AgentEngine:
         user_message: str,
         messages: list[dict],
         image_msg_index: int,
+        *,
+        owner: bool = False,
+        isolated: bool = False,
     ) -> str:
         """工具循环：逐 step 调 LLM、执行工具、熔断与收尾（行为见各分支注释）。"""
         empty_turns = 0
@@ -1368,7 +1385,7 @@ class AgentEngine:
         last_step_empty = False  # 最后一步是否"既无内容也无工具"（文案纠偏用）
         # 技能 schema 在整轮内不变（权限状态启动期加载、技能集固定），
         # 移出 tool-loop：旧实现每个 LLM step 都重算一遍过滤（审查 C3）
-        tool_schemas = self.skills.get_schemas(user_id, group_id)
+        tool_schemas = self.skills.get_schemas(user_id, group_id, owner=owner)
         active_schemas = tool_schemas  # 抓取熔断后收窄（见下方 budget 分支）
         for step in range(self.max_iterations):
             if step > 0:
@@ -1509,6 +1526,7 @@ class AgentEngine:
                                 func_name,
                                 user_id=user_id,
                                 group_id=group_id,
+                                owner=owner,
                                 **func_args,
                             )
                         )
@@ -1684,7 +1702,7 @@ class AgentEngine:
                     logger.exception("memory append failed for assistant message")
                 # 人格成长计数：每轮有效回复 +1，达阈值由 GrowthManager
                 # 后台回顾提议（不阻塞本轮；失败不影响回复）
-                if self.growth is not None:
+                if self.growth is not None and not isolated:
                     try:
                         await self.growth.maybe_trigger(user_id, session_id)
                     except Exception:
@@ -1763,7 +1781,7 @@ class AgentEngine:
                     )
                 except Exception:
                     logger.exception("memory append failed for final answer")
-                if self.growth is not None:
+                if self.growth is not None and not isolated:
                     try:
                         await self.growth.maybe_trigger(user_id, session_id)
                     except Exception:
@@ -1794,8 +1812,18 @@ class AgentEngine:
             return reason
         user_id = context.get("user_id", "unknown")
         group_id = context.get("group_id")
-        # 预算明细维度：当前对话路由（client 经 contextvar 读取记入 by_route）
-        current_route.set(f"group:{group_id}" if group_id else f"private:{user_id}")
+        # D4 M2：cron agent_turn 以「owner 代理」跑一轮——owner 放宽技能面（与私聊
+        # owner 同权），isolated 关掉事实抽取与人格成长：会话是一次性的，不该把
+        # 定时任务的输出写进任何人的长期记忆，也不该推动人格成长。
+        owner = bool(context.get("owner"))
+        isolated = bool(context.get("isolated"))
+        # 预算明细维度：当前对话路由（client 经 contextvar 读取记入 by_route）。
+        # cron 显式给 route（cron:<job_id>）：否则会记成 private:cron:<job_id>，
+        # 与真实私聊混在同一个维度里，预算报表分不清。
+        current_route.set(
+            context.get("route")
+            or (f"group:{group_id}" if group_id else f"private:{user_id}")
+        )
         session_id = await self.memory.resolve_session(user_id, group_id)
 
         (
@@ -1815,6 +1843,7 @@ class AgentEngine:
             session_id,
             user_message,
             extraction_text,
+            isolated=isolated,
         )
         messages, image_msg_index = self._build_turn_messages(
             context,
@@ -1840,4 +1869,6 @@ class AgentEngine:
             user_message,
             messages,
             image_msg_index,
+            owner=owner,
+            isolated=isolated,
         )

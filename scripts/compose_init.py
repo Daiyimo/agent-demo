@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from collections.abc import Callable
@@ -52,6 +53,8 @@ DATA_DIRS = (
     "state",
     "mirror",
     "ssh",
+    "cron",
+    "personas",
 )
 
 # data/ 根下的单文件状态。默认按 CWD 落在 data/ 根，而 compose 只挂了 data/state/
@@ -245,7 +248,7 @@ def _write_config_yaml(target: Path, source: Path) -> None:
 
 
 # 默认人格模板在镜像里的位置。Dockerfile COPY agentcore 时一起进镜像，
-# 但 **data/workspace 是 compose 的挂载点**——模板放那儿会被宿主空目录遮掉，
+# 但 **data/personas 是 compose 的挂载点**——模板放那儿会被宿主空目录遮掉，
 # 所以必须放在包内，由自举复制到挂载目录。
 SOUL_TEMPLATE = (
     Path(__file__).resolve().parent.parent
@@ -265,7 +268,7 @@ def _write_soul_md(target: Path, root: Path) -> None:
     """自举用的默认人格落地：复制包内模板；缺失时写最小兜底并告警。
 
     与 config.yaml 同思路：自举在容器启动路径上，不能因为缺模板就让容器起不来。
-    用户随后编辑 ``data/workspace/SOUL.md`` 即可换人格（OpenClaw 兼容格式）。
+    用户随后编辑 ``data/personas/SOUL.md`` 即可换人格（OpenClaw 兼容格式）。
     """
     template = SOUL_TEMPLATE if SOUL_TEMPLATE.is_file() else root / SOUL_TEMPLATE.name
     if template.is_file():
@@ -273,10 +276,42 @@ def _write_soul_md(target: Path, root: Path) -> None:
         return
     print(
         f"WARNING: 人格模板 {SOUL_TEMPLATE} 不存在，已写入最小兜底 SOUL.md；"
-        "请编辑 data/workspace/SOUL.md 自定义人格",
+        "请编辑 data/personas/SOUL.md 自定义人格",
         file=sys.stderr,
     )
     target.write_text(_FALLBACK_SOUL, encoding="utf-8")
+
+
+# 定时任务模板：随仓库分发，入库内容只能是占位号（真实群号留在本机）。
+CRON_TEMPLATE = (
+    Path(__file__).resolve().parent.parent
+    / "docs"
+    / "examples"
+    / "cron-jobs.example.json"
+)
+
+_FALLBACK_CRON = """{
+  "version": 1,
+  "jobs": []
+}
+"""
+
+
+def _write_cron_jobs(target: Path, root: Path) -> None:
+    """首启放一份定时任务模板；模板缺失时写空任务表（不阻塞启动）。"""
+    template = CRON_TEMPLATE if CRON_TEMPLATE.is_file() else root / CRON_TEMPLATE.name
+    if template.is_file():
+        shutil.copyfile(template, target)
+    else:
+        print(
+            f"WARNING: 定时任务模板 {CRON_TEMPLATE} 不存在，已写入空 jobs.json",
+            file=sys.stderr,
+        )
+        target.write_text(_FALLBACK_CRON, encoding="utf-8")
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
 
 
 def bootstrap(app_root: Path, *, source_config: Path | None = None) -> dict[str, str]:
@@ -313,13 +348,19 @@ def bootstrap(app_root: Path, *, source_config: Path | None = None) -> dict[str,
         lambda p: p.write_text(WEB_ENV_HEADER, encoding="utf-8"),
     )
 
-    # --- data/workspace/SOUL.md：默认人格（OpenClaw 兼容，纯 markdown） ---
+    # --- data/personas/SOUL.md：默认人格（OpenClaw 兼容，纯 markdown） ---
     # 模板随镜像烤在 agentcore/personas/templates/ 里（Dockerfile COPY agentcore
-    # 时一起进）。**不能把模板直接放在 data/workspace/**：那目录是 compose 的挂载点，
+    # 时一起进）。**不能把模板直接放在 data/personas/**：那目录是 compose 的挂载点，
     # 镜像里那份会被宿主的空目录整体遮掉，首启就没人写默认人格了。
     report["soul"] = _ensure_file(
-        root / "data" / "workspace" / "SOUL.md",
+        root / "data" / "personas" / "SOUL.md",
         lambda p: _write_soul_md(p, root),
+    )
+    # --- data/cron/jobs.json：定时任务模板（默认 enabled:false，不误触发） ---
+    # 只做「没文件时放一份样例」，用户手改过的 jobs.json 一律保留。
+    report["cron"] = _ensure_file(
+        root / "data" / "cron" / "jobs.json",
+        lambda p: _write_cron_jobs(p, root),
     )
 
     missing_dirs = [name for name in DATA_DIRS if not (root / "data" / name).is_dir()]

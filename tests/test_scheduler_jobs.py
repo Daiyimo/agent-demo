@@ -1,6 +1,7 @@
 """jobs.json 定时任务：解析 / 校验 / 落盘 / 状态回写 / agent_turn 执行。
 
-2026-10-28 需求②：OpenClaw 兼容的 ``data/workspace/cron/jobs.json``，只接管
+2026-10-28 需求②：OpenClaw 兼容的 ``data/cron/jobs.json``（2026-10-29 从 data/workspace/
+移出沙箱写面，运行态另存同目录 state.json），只接管
 ``payload.kind == "agent_turn"``（到点让 agent 跑一轮并投递到指定会话）；
 kb_digest / db_backup / 群统计 / 提醒轮询仍是系统任务，继续走 env。
 
@@ -11,18 +12,20 @@ kb_digest / db_backup / 群统计 / 提醒轮询仍是系统任务，继续走 e
 4. 去掉 enabled 过滤 → 停用的 job 照样跑，用例红
 5. 去掉 _warn_once 去重 → 告警刷屏，用例红
 6. 去掉写后重读校验 → 半截文件不回落，用例红
+7. 去掉群目标白名单判定 → 白名单外的群照样跑引擎并投递，`TestTargetACL` 红
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
 import pytest
 
 from agentcore.scheduler import jobs as J
-from agentcore.scheduler.agent_turn import AgentTurnRunner, _next_run_ms
+from agentcore.scheduler.agent_turn import _NEVER_FIRE, AgentTurnRunner, _next_run_ms
 
 
 @pytest.fixture(autouse=True)
@@ -53,8 +56,8 @@ def _job_dict(**over):
 
 class TestPaths:
     def test_default_dir(self):
-        assert J.cron_dir() == Path("data/workspace/cron")
-        assert J.jobs_path() == Path("data/workspace/cron/jobs.json")
+        assert J.cron_dir() == Path("data/cron")
+        assert J.jobs_path() == Path("data/cron/jobs.json")
 
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv("AGENT_CRON_DIR", "/tmp/mycron")
@@ -64,7 +67,7 @@ class TestPaths:
         """M18 同型：env 空串/纯空白必须回落默认，不能变成 Path('') = '.'。"""
         for raw in ("", "   "):
             monkeypatch.setenv("AGENT_CRON_DIR", raw)
-            assert J.cron_dir() == Path("data/workspace/cron")
+            assert J.cron_dir() == Path("data/cron")
 
 
 class TestParseJobs:
@@ -106,6 +109,21 @@ class TestParseJobs:
             {"jobs": [_job_dict(schedule={"kind": "cron", "expr": "not a cron"})]}
         )
         assert jobs == [] and "cron" in errors[0]
+
+    def test_rejects_never_fire_cron_expr(self):
+        """能解析但永触发（2 月 30 日）必须拒：`_next_run_ms` 对这类表达式返 0，
+        而 tick 的「首次运行」语义把 0 当没跑过 → 每 60s 跑一次完整 LLM 回合。"""
+        jobs, errors = J.parse_jobs(
+            {"jobs": [_job_dict(schedule={"kind": "cron", "expr": "0 0 30 2 *"})]}
+        )
+        assert jobs == [] and "永触发" in errors[0]
+
+    def test_accepts_leap_day_cron_expr(self):
+        """闰日（2 月 29）每 4 年真会触发，不是永触发，不能误拒。"""
+        jobs, errors = J.parse_jobs(
+            {"jobs": [_job_dict(schedule={"kind": "cron", "expr": "0 0 29 2 *"})]}
+        )
+        assert len(jobs) == 1 and errors == []
 
     def test_rejects_empty_cron(self):
         jobs, errors = J.parse_jobs(
@@ -361,7 +379,8 @@ class TestSave:
         assert raw["payload"]["kind"] == "agent_turn"
         assert raw["payload"]["to"] == "group:123"
         assert "deleteAfterRun" in raw and "createdAtMs" in raw
-        assert raw["state"]["lastStatus"] == ""
+        # 运行状态自 2026-10-29 起落在 state.json，配置面不再掺运行期数据
+        assert "state" not in raw and "updatedAtMs" not in raw
 
     def test_tz_omitted_when_none(self, tmp_path):
         p = tmp_path / "jobs.json"
@@ -420,6 +439,14 @@ class TestNextRun:
     def test_bad_expr_returns_zero(self):
         assert _next_run_ms("not a cron", None) == 0
 
+    def test_never_fire_returns_negative_sentinel(self):
+        """永触发必须与「解析失败」分开：0 是「从没跑过」的合法值。"""
+        assert _next_run_ms("0 0 30 2 *", None) == _NEVER_FIRE
+        assert _NEVER_FIRE < 0
+
+    def test_leap_day_is_not_never_fire(self):
+        assert _next_run_ms("0 0 29 2 *", None) > 0
+
 
 class _FakeEngine:
     def __init__(self, text="报告内容"):
@@ -441,17 +468,40 @@ class _FakeSink:
         return self.outcome
 
 
+class _InspectingSink:
+    """投递时读一次 jobs.json，记录此刻落盘的状态（验证 pending 先于 send）。"""
+
+    def __init__(self, path, *, crash=False):
+        self.path = path
+        self.crash = crash
+        self.seen = []
+
+    async def send_once(self, target, message):
+        jobs, _ = J.load(self.path)
+        self.seen.append((jobs[0].last_status, jobs[0].next_run_at_ms))
+        if self.crash:
+            raise RuntimeError("boom")
+        return "sent"
+
+
 class TestAgentTurnRunner:
     @pytest.mark.asyncio
     async def test_runs_and_delivers(self, tmp_path):
         p = tmp_path / "jobs.json"
         J.save([_cron_job()], p)
         eng, sink = _FakeEngine(), _FakeSink()
-        runner = AgentTurnRunner(eng, sink)
+        runner = AgentTurnRunner(eng, sink, allowed_groups={"123"}, jobs_file=p)
         status = await runner.run_job(J.load(p)[0][0])
         assert status == "ok"
         assert eng.calls[0][1] == "执行脚本并发到群里"
-        assert eng.calls[0][0]["group_id"] == "123"
+        # D4 M2：cron 回合是隔离的 owner 代理——会话键用 cron:<job_id>，不是目标群号
+        assert eng.calls[0][0] == {
+            "user_id": "cron:j1",
+            "group_id": None,
+            "owner": True,
+            "isolated": True,
+            "route": "cron:j1",
+        }
         assert sink.sent == [("group:123", "报告内容")]
 
     @pytest.mark.asyncio
@@ -459,7 +509,7 @@ class TestAgentTurnRunner:
         p = tmp_path / "jobs.json"
         J.save([_cron_job()], p)
         eng, sink = _FakeEngine(text="   "), _FakeSink()
-        runner = AgentTurnRunner(eng, sink)
+        runner = AgentTurnRunner(eng, sink, allowed_groups={"123"}, jobs_file=p)
         assert await runner.run_job(J.load(p)[0][0]) == "failed"
         assert sink.sent == []
 
@@ -468,7 +518,12 @@ class TestAgentTurnRunner:
         """结果不确定绝不重发：记 uncertain 而非 failed（出站铁律）。"""
         p = tmp_path / "jobs.json"
         J.save([_cron_job()], p)
-        runner = AgentTurnRunner(_FakeEngine(), _FakeSink(outcome="uncertain"))
+        runner = AgentTurnRunner(
+            _FakeEngine(),
+            _FakeSink(outcome="uncertain"),
+            allowed_groups={"123"},
+            jobs_file=p,
+        )
         assert await runner.run_job(J.load(p)[0][0]) == "uncertain"
 
     @pytest.mark.asyncio
@@ -480,7 +535,9 @@ class TestAgentTurnRunner:
             async def run(self, *a, **kw):
                 raise RuntimeError("boom")
 
-        runner = AgentTurnRunner(_Boom(), _FakeSink())
+        runner = AgentTurnRunner(
+            _Boom(), _FakeSink(), allowed_groups={"123"}, jobs_file=p
+        )
         assert await runner.run_job(J.load(p)[0][0]) == "failed"
 
     @pytest.mark.asyncio
@@ -524,6 +581,24 @@ class TestAgentTurnRunner:
             await runner.tick()
         assert caplog.text.count("读取失败") == 1, caplog.text
 
+    @pytest.mark.asyncio
+    async def test_run_job_rejects_never_fire_expr(self, caplog):
+        """永触发表达式不能跑引擎：装载期已拒，run_job 这道闸要接住直调方。
+
+        run_job 是执行一条 job 的唯一入口（tick 也走它），所以守卫放这里而
+        不是只放 tick——放 tick 的版本在装载期修复后不可达，用例会退化成
+        恒真断言（删掉守卫照样绿）。
+        """
+        import logging
+
+        eng, sink = _FakeEngine(), _FakeSink()
+        runner = AgentTurnRunner(eng, sink, allowed_groups={"123"})
+        with caplog.at_level(logging.WARNING, logger="agentcore.scheduler.agent_turn"):
+            status = await runner.run_job(_cron_job(cron="0 0 30 2 *"))
+        assert status == "failed"
+        assert eng.calls == [] and sink.sent == []
+        assert caplog.text.count("永触发") == 1, caplog.text
+
     def test_warn_once_dedups(self):
         runner = AgentTurnRunner(None, None)
         runner._warn_once("same")
@@ -534,16 +609,163 @@ class TestAgentTurnRunner:
         assert AgentTurnRunner(None, None).register() is False
 
 
-class TestRepoJobsFile:
-    """看守仓库自带的 jobs.json：格式必须合法，且默认停用（不误触发）。"""
+class TestTargetACL:
+    """群目标必须命中 ALLOWED_GROUPS（2026-10-29）。
+
+    此前文档承诺「不在白名单不会投递」，代码完全不看白名单：手滑写一个真实群号，
+    agent 就会在未授权群里跑一轮并说话（既有 bug，不是新功能）。
+    变异锚点：删掉 ``run_job`` 里的 ``_target_allowed`` 分支 → 本类全部红。
+    """
+
+    @pytest.mark.asyncio
+    async def test_group_outside_whitelist_not_run(self, tmp_path, monkeypatch, caplog):
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        # update_state 不回写 jobs.json 的 path 参数，只能靠 env 把它导向 tmp，
+        # 否则会去读仓库里那份真实文件（jobs.update_state 的既有坑）。
+        monkeypatch.setenv("AGENT_CRON_DIR", str(tmp_path))
+        eng, sink = _FakeEngine(), _FakeSink()
+        runner = AgentTurnRunner(eng, sink, allowed_groups={"456"}, jobs_file=p)
+        with caplog.at_level(logging.WARNING, logger="agentcore.scheduler.agent_turn"):
+            status = await runner.run_job(J.load(p)[0][0])
+        assert status == "failed"
+        assert eng.calls == [], "白名单外的目标不得跑引擎（省 token，也不外泄模型输出）"
+        assert sink.sent == [], "零投递"
+        assert "ALLOWED_GROUPS" in caplog.text and "j1" in caplog.text
+        # 拦截同样要推进下次执行时刻：否则 tick 每 60s 重试一次，日志与备份都刷屏
+        jobs, _ = J.load(p)
+        assert jobs[0].last_status == "failed"
+        assert jobs[0].next_run_at_ms > 0
+
+    @pytest.mark.asyncio
+    async def test_group_inside_whitelist_runs(self, tmp_path):
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        eng, sink = _FakeEngine(), _FakeSink()
+        runner = AgentTurnRunner(eng, sink, allowed_groups={"123"}, jobs_file=p)
+        assert await runner.run_job(J.load(p)[0][0]) == "ok"
+        assert sink.sent == [("group:123", "报告内容")]
+
+    @pytest.mark.asyncio
+    async def test_empty_whitelist_denies_group(self, tmp_path):
+        """空集 = 一律拒绝（fail-closed），与 acl.is_allowed 同口径。"""
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        eng, sink = _FakeEngine(), _FakeSink()
+        runner = AgentTurnRunner(eng, sink, jobs_file=p)
+        assert await runner.run_job(J.load(p)[0][0]) == "failed"
+        assert eng.calls == [] and sink.sent == []
+
+    @pytest.mark.asyncio
+    async def test_private_target_allowed_without_group_whitelist(self, tmp_path):
+        """私聊目标不受群白名单约束（jobs.json 是部署者本机的配置）。"""
+        p = tmp_path / "jobs.json"
+        job = _cron_job(to="private:10001")
+        J.save([job], p)
+        eng, sink = _FakeEngine(), _FakeSink()
+        runner = AgentTurnRunner(eng, sink, jobs_file=p)
+        assert await runner.run_job(J.load(p)[0][0]) == "ok"
+        assert sink.sent == [("private:10001", "报告内容")]
+        assert eng.calls[0][0] == {
+            "user_id": "cron:j1",
+            "group_id": None,
+            "owner": True,
+            "isolated": True,
+            "route": "cron:j1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_acl_warning_deduped_per_job(self, tmp_path, monkeypatch, caplog):
+        """ACL 是启动期常量，告警按 (job, 目标) 去重，不随 tick 刷屏。"""
+        job = _cron_job()
+        p = tmp_path / "jobs.json"
+        J.save([job], p)
+        monkeypatch.setenv("AGENT_CRON_DIR", str(tmp_path))
+        runner = AgentTurnRunner(
+            _FakeEngine(), _FakeSink(), allowed_groups={"456"}, jobs_file=p
+        )
+        with caplog.at_level(logging.WARNING, logger="agentcore.scheduler.agent_turn"):
+            await runner.run_job(job)
+            await runner.run_job(job)
+        assert caplog.text.count("ALLOWED_GROUPS") == 1, caplog.text
+
+
+class TestPendingBeforeSend:
+    """L3：投递前先落 pending + 推进下次执行，崩溃窗口不重投（2026-10-29）。"""
+
+    @pytest.mark.asyncio
+    async def test_pending_written_before_send(self, tmp_path):
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        sink = _InspectingSink(p)
+        runner = AgentTurnRunner(
+            _FakeEngine(), sink, allowed_groups={"123"}, jobs_file=p
+        )
+        assert await runner.run_job(J.load(p)[0][0]) == "ok"
+        status, next_ms = sink.seen[0]
+        assert status == "pending", "send_once 之前状态必须是 pending（崩溃窗口标记）"
+        assert next_ms > 0
+        jobs, _ = J.load(p)
+        assert jobs[0].last_status == "ok", "正常路径随后被最终状态覆盖"
+
+    @pytest.mark.asyncio
+    async def test_crash_during_send_is_not_redelivered(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_CRON_DIR", str(tmp_path))
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        eng, sink = _FakeEngine(), _InspectingSink(p, crash=True)
+        runner = AgentTurnRunner(eng, sink, allowed_groups={"123"}, jobs_file=p)
+        with pytest.raises(RuntimeError):
+            await runner.run_job(J.load(p)[0][0])
+        # 崩在投递中途：状态停在 pending，但下次执行已推进
+        jobs, _ = J.load(p)
+        assert jobs[0].last_status == "pending"
+        assert jobs[0].next_run_at_ms > 0
+        # tick 不再重跑这一轮（否则用户会收到两遍）
+        await runner.tick()
+        assert len(eng.calls) == 1
+        assert len(sink.seen) == 1
+
+
+class TestHandEditReload:
+    """「手改 jobs.json 下轮 tick 生效」必须真的重读文件（B3，2026-10-29 补）。
+
+    此前 tick 只读默认路径，测试传 ``jobs_file`` 时读的却是另一份文件——
+    「不重投」那条用例因此没真正验到 state，本条把读路径也锁住。
+    """
+
+    @pytest.mark.asyncio
+    async def test_tick_reads_edited_file_without_restart(self, tmp_path):
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job(message="第一版")], p)
+        eng, sink = _FakeEngine(), _FakeSink()
+        runner = AgentTurnRunner(eng, sink, allowed_groups={"123"}, jobs_file=p)
+        await runner.tick()
+        assert [m for _c, m in eng.calls] == ["第一版"]
+        # 模拟管理员直接编辑：改文案，并把下次执行时刻拨回「立即」（状态侧车挡着）
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw["jobs"][0]["payload"]["message"] = "第二版"
+        p.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        side = J.state_path(p)
+        if side.exists():
+            side.unlink()
+        await runner.tick()
+        assert [m for _c, m in eng.calls] == ["第一版", "第二版"], "手改必须下轮生效"
+        assert len(sink.sent) == 2
+
+
+class TestCronTemplateExample:
+    """看守仓库自带的模板 ``docs/examples/cron-jobs.example.json``（2026-10-29 搬出 data/）。
+
+    模板不入 ``data/cron/``：那是运行时目录（gitignore），且真实群号必须留在本机。
+    """
 
     def test_repo_jobs_file_is_valid(self):
         p = (
             Path(__file__).resolve().parents[1]
-            / "data"
-            / "workspace"
-            / "cron"
-            / "jobs.json"
+            / "docs"
+            / "examples"
+            / "cron-jobs.example.json"
         )
         assert p.is_file(), "仓库应自带一份 jobs.json 样例"
         jobs, errors = J.load(p)
@@ -554,14 +776,118 @@ class TestRepoJobsFile:
             assert j.channel == "onebot"
             assert J.parse_target(j.to) is not None
 
-    def test_repo_jobs_file_is_tracked(self):
-        """必须入库：否则换机器/重建镜像后定时任务全丢。"""
+    def test_repo_jobs_file_is_committable_and_runtime_is_ignored(self):
+        """模板必须入库（不被 ignore）；``data/cron/`` 是运行时目录，必须被 ignore。"""
         import subprocess
 
-        r = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "data/workspace/cron/jobs.json"],
-            capture_output=True,
-            text=True,
-            cwd=str(Path(__file__).resolve().parents[1]),
+        root = str(Path(__file__).resolve().parents[1])
+
+        def ignored(rel: str) -> bool:
+            return (
+                subprocess.run(
+                    ["git", "check-ignore", "-q", rel],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                ).returncode
+                == 0
+            )
+
+        assert not ignored("docs/examples/cron-jobs.example.json")
+        assert ignored("data/cron/jobs.json")
+        assert ignored("data/cron/state.json")
+
+
+class TestStateSidecar:
+    """运行状态落 ``state.json``（2026-10-29），jobs.json 保持纯配置。
+
+    变异锚点：把 ``update_state`` 改回写 jobs.json、或去掉 sidecar 读回落，
+    本类必须红。
+    """
+
+    @staticmethod
+    def _write(p, jobs, state_map=None):
+        import json
+
+        data = {"version": 1, "jobs": jobs}
+        if state_map is not None:
+            for job in data["jobs"]:
+                if job["id"] in state_map:
+                    job["state"] = state_map[job["id"]]
+        p.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_update_state_does_not_touch_jobs_json(self, tmp_path):
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        before = p.read_bytes()
+        J.update_state("j1", status="ok", next_run_ms=1234, path=p)
+        assert p.read_bytes() == before
+        assert J.state_path(p) == tmp_path / "state.json"
+        states = json.loads(J.state_path(p).read_text(encoding="utf-8"))["jobs"]
+        assert states["j1"]["lastStatus"] == "ok"
+        assert states["j1"]["nextRunAtMs"] == 1234
+        # 读回来时 sidecar 被叠加到 job 上
+        jobs, _ = J.load(p)
+        assert jobs[0].last_status == "ok" and jobs[0].next_run_at_ms == 1234
+
+    def test_legacy_embedded_state_is_read_fallback(self, tmp_path):
+        p = tmp_path / "jobs.json"
+        self._write(
+            p,
+            [_job_dict()],
+            {"j1": {"nextRunAtMs": 7, "lastRunAtMs": 8, "lastStatus": "failed"}},
         )
-        assert r.returncode == 0, "data/workspace/cron/jobs.json 必须被 git 跟踪"
+        jobs, _ = J.load(p)
+        assert (
+            jobs[0].last_status,
+            jobs[0].last_run_at_ms,
+            jobs[0].next_run_at_ms,
+        ) == (
+            "failed",
+            8,
+            7,
+        )
+
+    def test_sidecar_wins_over_embedded(self, tmp_path):
+        p = tmp_path / "jobs.json"
+        self._write(p, [_job_dict()], {"j1": {"lastStatus": "failed"}})
+        J.state_path(p).write_text(
+            json.dumps({"version": 1, "jobs": {"j1": {"lastStatus": "ok"}}}),
+            encoding="utf-8",
+        )
+        jobs, _ = J.load(p)
+        assert jobs[0].last_status == "ok"
+
+    def test_corrupt_sidecar_warns_and_falls_back(self, tmp_path, caplog):
+        p = tmp_path / "jobs.json"
+        self._write(p, [_job_dict()], {"j1": {"lastStatus": "failed"}})
+        J.state_path(p).write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="agentcore.scheduler.jobs"):
+            jobs, _ = J.load(p)
+        assert jobs[0].last_status == "failed"
+        assert "state sidecar" in caplog.text
+
+    def test_save_persists_existing_state(self, tmp_path):
+        p = tmp_path / "jobs.json"
+        self._write(p, [_job_dict()], {"j1": {"lastStatus": "ok", "lastRunAtMs": 5}})
+        jobs, _ = J.load(p)
+        J.save(jobs, p)
+        raw = json.loads(p.read_text(encoding="utf-8"))["jobs"][0]
+        assert "state" not in raw
+        states = json.loads(J.state_path(p).read_text(encoding="utf-8"))["jobs"]
+        assert states["j1"]["lastStatus"] == "ok" and states["j1"]["lastRunAtMs"] == 5
+
+    def test_delete_after_run_clears_sidecar_entry(self, tmp_path):
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job(delete_after_run=True)], p)
+        J.update_state("j1", status="ok", path=p)
+        jobs, _ = J.load(p)
+        assert jobs == []
+        states = json.loads(J.state_path(p).read_text(encoding="utf-8"))["jobs"]
+        assert "j1" not in states
+
+    def test_no_state_file_written_for_fresh_save(self, tmp_path):
+        """全是空状态时不留空壳 sidecar（全新部署的目录保持干净）。"""
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        assert not J.state_path(p).exists()
