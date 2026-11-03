@@ -215,6 +215,8 @@ class AgentTurnRunner:
         # 所以预算闸必须放在引擎**之前**——省 LLM 调用，也省一次无意义的 tool-loop。
         # 仍推进下次执行时刻：否则 tick 会每 60s 重试一次，把日志刷满。
         if not self._budget.check(job.to, "agent_turn"):
+            # P4：被全局预算拦下要留痕（面板「待决定区」据此显示"被挡下几次"）
+            self._budget.record_blocked(job.to, "agent_turn")
             self._warn_budget_once(job, job.to)
             update_state(
                 job.id,

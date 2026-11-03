@@ -979,3 +979,23 @@ class TestNotifyBudgetGate:
             await runner.run_job(J.load(p)[0][0])
             await runner.run_job(J.load(p)[0][0])
         assert caplog.text.count("打扰预算") == 1, caplog.text
+    @pytest.mark.asyncio
+    async def test_blocked_is_counted_separately(self, tmp_path, monkeypatch, caplog):
+        """P4：被拦下的那一轮要单独记账（blocked 段），且不占 spent。"""
+        p = tmp_path / "jobs.json"
+        J.save([_cron_job()], p)
+        monkeypatch.setenv("AGENT_CRON_DIR", str(tmp_path))
+        runner = AgentTurnRunner(
+            _FakeEngine(), _FakeSink(), allowed_groups={"123"}, jobs_file=p
+        )
+        budget = self._exhaust(runner)
+        with caplog.at_level(logging.WARNING, logger="agentcore.scheduler.agent_turn"):
+            await runner.run_job(J.load(p)[0][0])
+        # 被拦计数落 blocked 段；days 段只有占位的那一次 push
+        assert budget.blocked_by_kind("group:123") == {"agent_turn": 1}
+        assert budget.by_kind("group:123") == {"push": 1}
+        # 拦下不占额度：上限还是 1，已用 1，剩余 0（不是 -1）
+        assert budget.spent("group:123") == 1
+        snap = budget.blocked_snapshot()
+        assert snap["targets"]["group:123"] == {"total": 1, "agent_turn": 1}
+

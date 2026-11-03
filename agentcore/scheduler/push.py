@@ -572,6 +572,8 @@ class PushService:
         ``AGENT_NOTIFY_DAILY_LIMIT`` 是跨 push/nudge/agent_turn 的天花板。
         """
         if not self._budget.check(target, "push", now):
+            # P4：只记**全局闸**拦下的（细分上限命中和这里是两回事，前者不算"被预算拦下"）
+            self._budget.record_blocked(target, "push", now)
             return True
         cap = self.cfg.daily_cap_per_target
         if cap <= 0:  # 0 = 不限
@@ -595,7 +597,8 @@ class PushService:
             return
         except Exception:
             logger.warning(
-                "push: 旧计数状态文件损坏，忽略（%s）", self._legacy_state,
+                "push: 旧计数状态文件损坏，忽略（%s）",
+                self._legacy_state,
             )
             return
         day = self._day_key(time.time())
@@ -613,7 +616,8 @@ class PushService:
             for _ in range(n):
                 self._budget.record(str(target), "push", now)
         logger.info(
-            "push: 已把旧计数文件 %s 的当日计数导入共享打扰预算", self._legacy_state,
+            "push: 已把旧计数文件 %s 的当日计数导入共享打扰预算",
+            self._legacy_state,
         )
 
     async def _content(self, params: dict) -> tuple[str, bool]:
