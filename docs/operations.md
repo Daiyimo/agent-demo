@@ -295,7 +295,8 @@ QQ `/reboot` 与 web 重启一律拒绝——`os.execve` 自替换 **PID 不变*
 修改（手工改过的示例技能、出厂人格模板）是 `blocking_dirty` 刻意放过的——但它们会被
 回滚的 `reset --hard` 一并丢弃。现在 `_rollback` 在 reset **之前**把它们落到
 `data/backups/update-rollback/<时间戳>-<prev12>/`（可 `git apply` 的 patch + 文件原文
-副本）；未跟踪文件（技能安装产物、渲染图）不受 `reset --hard` 影响，不备份。备份失败
+副本；**patch 应用不上时至少能手工拷回原文**——`runtime.patch` 在 reset 后经实测存在
+`git apply` 失败形态，原文副本是最终兜底，见 BACKLOG §6.20 XM-5）；未跟踪文件（技能安装产物、渲染图）不受 `reset --hard` 影响，不备份。备份失败
 只留痕、不阻断回滚——回滚本身是恢复手段。
 
 **回退**：更新自动回滚之外，人工回退是 `git -C <prod> reset --hard <sha>` +
@@ -412,6 +413,31 @@ python scripts/backup_db.py restore-archive --dry-run            # 先看会灌�
 python scripts/backup_db.py restore-archive --yes                # 真回灌
 python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢复某天之后
 ```
+
+**恢复演练（强烈建议定期跑）**：没真恢复过的备份等于信仰。`scripts/drill_restore.py` 把整条链
+固化成一条命令：选最新备份 → verify（SHA256）→ 灌进固定名临时库 `agent_demo_scratch` → 行数对比
+（容忍备份后增量，`--max-drift-pct` 默认 10%）→ 向量抽查（等距样本 md5 + 维度）→ `migrate` 账本
+自愈（备份排除 `schema_migrations`，恢复库必须能从空账本重建）→ 清场。源库全程只读，写面只有
+一次性临时库；失败保留现场退出非 0（排查后 `python scripts/scratch_db.py drop --yes`）：
+
+```bash
+export $(grep -E '^DATABASE_URL=' .env | head -1)   # 源库（只读对比基准，须与备份同源）
+python scripts/drill_restore.py                     # 全流程；成功清场退出 0
+python scripts/drill_restore.py --dry-run           # 只选最新备份 + verify
+```
+
+注意要在**部署目录**下运行：脚本从当前目录向上找 `.env` 确定源库，跨目录调用会拿到另一份部署
+的库、演练必然红。可挂 systemd timer / crontab 每周跑一次。三条使用限制：
+
+- **只演练非加密的 pg_dump 备份**：开了 `AGENT_BACKUP_ENCRYPT=age` 的部署备份目录里只有
+  `.sql.gz.age`，脚本会 fail-loud 提示「没有可演练的（非加密）pg_dump 备份」——加密备份需先
+  按 restore 同口径解密再演练。
+- **共享 PG 实例请勿挂自动演练**：脚本建/删临时库用 `DROP DATABASE … WITH (FORCE)`，会踢掉
+  该库上别人的连接（与 `scratch_db` 同名的固定库）。共用实例（多人开发/多部署）的机器请先
+  约定 `agent_demo_scratch` 独占，或只跑 `--dry-run`。
+- 演练目标库名是**固定字面量** `agent_demo_scratch`（由 `DATABASE_URL` 换 path 而来）：
+  配置错误最多打错实例，不会把恢复灌进 `DATABASE_URL` 指向的库本身；但病态情形（源库自己
+  就叫 `agent_demo_scratch`）会因当前连接占用被 PG 拒绝、fail-loud。
 
 **异地镜像（推荐开启）**：备份与原库在同一块盘时，挡得住误删、挡不住盘坏。设置
 `AGENT_BACKUP_MIRROR_DIR`（挂载的第二块盘 / NAS / 同步盘）后，每次备份会自动再复制一份到该
