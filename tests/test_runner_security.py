@@ -1149,7 +1149,79 @@ class TestReadonlyMemoryCommands:
     def test_memory_sampling_cmds_allowed(self):
         assert permitted("vmstat", ["-s"])[0]
         assert permitted("pidstat", ["-r", "-p", "1", "1", "1"])[0]
+        assert permitted("iostat", ["-f", "sardir", "1"])[0]
         assert permitted("pmap", ["-x", "1"])[0]
+
+    def test_pidstat_e_flag_is_arbitrary_execution(self):
+        """H1（REVIEW-e079b8d..3a3ce4a）：-e <程序> <参数> 执行任意程序。
+
+        修前 `pidstat -e touch x 1 1` 经免参数集合直达执行（完整链路工作区
+        落盘复现）；修后专属校验显式拒 -e，low 只读档同样拒。
+        """
+        ok, reason = permitted("pidstat", ["-e", "sh", "-c", "id u", "1", "1"])
+        assert not ok, reason
+        # 断言对准**显式 -e 拒绝层**的文案：白名单路径的 reason 是「不允许
+        # 该选项」，不含「执行任意程序」——这样即使未来有人误把 -e 加进
+        # flag 白名单，显式拒绝层仍在、用例仍能区分。
+        assert "执行任意程序" in reason
+        ok_ro, reason_ro = permitted(
+            "pidstat", ["-e", "touch", "x", "1", "1"], readonly_only=True
+        )
+        assert not ok_ro, reason_ro
+        # 下载+再执行的两阶段链同样在 -e 这一层就断
+        ok_w, reason_w = permitted(
+            "pidstat", ["-e", "wget", "-q", "http://x/y", "-O", "z"]
+        )
+        assert not ok_w, reason_w
+
+    def test_pidstat_unknown_flag_and_non_numeric_rejected(self):
+        ok, reason = permitted("pidstat", ["--whatever"])
+        assert not ok and reason
+        # 全角数字过不了 ASCII 数字判据
+        ok_fw, reason_fw = permitted("pidstat", ["１"])
+        assert not ok_fw, reason_fw
+        # 正常采样仍放行
+        assert permitted("pidstat", ["-u", "1", "2"])[0]
+        assert permitted("pidstat", ["-r", "-p", "1", "1", "1"])[0]
+        assert permitted("pidstat", ["--human", "-d"])[0]
+
+    def test_pmap_rc_files_and_kernel_addr_rejected(self):
+        """M1：-n/-N/-C 会写 rc 文件（pmap -n 实测落 .pmaprc），-X 内核地址。"""
+        for args in (
+            ["-n"],
+            ["-N", "rcfile", "1"],
+            ["--create-rc"],
+            ["-C", "rcfile", "1"],
+            ["--read-rc-from=rcfile", "1"],
+            ["-X", "1"],
+        ):
+            ok, reason = permitted("pmap", args)
+            assert not ok, args
+            assert reason, args
+
+    def test_pmap_non_numeric_pid_rejected(self):
+        """AGENTS 沙箱行「pmap(需数字 pid)」：修前非数字位置参数也放行。"""
+        for args in (["-x", "notapid"], ["1", "x"], ["１"]):
+            ok, reason = permitted("pmap", args)
+            assert not ok, args
+            assert reason, args
+        assert permitted("pmap", ["-x", "1"])[0]
+        assert permitted("pmap", ["-p", "42", "-q"])[0]
+
+    def test_systemd_cgtop_machine_forms_rejected(self):
+        """L9：--machine=xxx（= 形态）与 -M host 一拒一放的口径分裂。"""
+        for args in (
+            ["-b", "-M", "host"],
+            ["-b", "--machine", "host"],
+            ["-b", "--machine=.host"],
+        ):
+            ok, reason = permitted("systemd-cgtop", args)
+            assert not ok, args
+            assert "machine" in reason
+        assert permitted("systemd-cgtop", ["-b", "-n", "1"])[0]
+        # 全角位置参数也拒
+        ok_fw, _ = permitted("systemd-cgtop", ["-b", "１"])
+        assert not ok_fw
 
     def test_systemd_cgtop_requires_batch(self):
         ok, reason = permitted("systemd-cgtop", ["-n", "1"])

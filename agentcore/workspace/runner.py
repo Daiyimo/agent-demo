@@ -236,14 +236,16 @@ _READONLY_OPS = {
     "id",
     "netstat",
     "lscpu",
-    # 内存/IO 归因（2026-11-05）：全是只读采样命令，没有写文件/执行代码选项。
-    # vmstat/pidstat/iostat/mpstat 是 procps/sysstat 的只读统计；pmap 只读
-    # /proc/<pid>/maps。swap 归因靠 proc_detail(sort=swap)，不靠这几个。
+    # 内存/IO 归因（2026-11-05）：procps/sysstat 的只读统计命令。这些命令
+    # 各自**没有**写文件/执行代码选项，故免专属校验走全局四道闸：
+    # - vmstat/mpstat：纯采样展示；
+    # - iostat：`-f/+f <目录>` 读的是 sar 数据目录（路径遏制限工作区内，
+    #   无任意文件读/写面）。
+    # pidstat 与 pmap **不在此列**：pidstat 的 `-e <程序> <参数>` 会执行任意
+    # 程序（H1），pmap 的 `-n/-N/-C` 会写 rc 文件（M1）——两者走下方专属校验。
     "vmstat",
-    "pidstat",
     "iostat",
     "mpstat",
-    "pmap",
 }
 
 # ss：展示/过滤类 flag 白名单。-K/--kill（断 socket）、-D（dump 到文件）、
@@ -699,12 +701,77 @@ def _swapon_ok(args: list[str]) -> tuple[bool, str]:
     return True, ""
 
 
+def _pidstat_ok(args: list[str]) -> tuple[bool, str]:
+    """pidstat：sysstat 的进程采样。**-e 是执行面**：`-e <程序> <参数>` 会把
+    任意程序拉起并监控（本机 sysstat 12.6.1 实锤：`pidstat -e touch x` 会执行
+    touch）——白名单里其它命令都没有这种选项，必须专属校验显式拒。位置参数
+    只允许 interval / interval,count（ASCII 数字）。"""
+    allowed = {
+        "-d",
+        "-h",
+        "-H",
+        "-I",
+        "-l",
+        "-R",
+        "-r",
+        "-s",
+        "-S",
+        "-t",
+        "-T",
+        "-U",
+        "-u",
+        "-v",
+        "-w",
+        "-C",
+        "-G",
+        "-p",
+        "--dec",
+        "--human",
+        "--version",
+    }
+    for a in args:
+        if a == "-e":
+            return False, ("pidstat 的 -e 会执行任意程序（-e <程序> <参数>），已拒绝")
+        if a.startswith("-"):
+            key = a.split("=", 1)[0]
+            if key in allowed:
+                continue
+            return False, f"pidstat 不允许该选项：{a!r}"
+        # 位置参数：interval 或 interval,count——ASCII 数字（全角 isdigit 坑）
+        if not all(p.isascii() and p.isdigit() for p in a.split(",") if p != ""):
+            return False, f"pidstat 位置参数仅接受采样间隔/次数（数字）：{a!r}"
+    return True, ""
+
+
+def _pmap_ok(args: list[str]) -> tuple[bool, str]:
+    """pmap：进程内存映射。rc 文件选项（-n/-N/--create-rc*/-C/--read-rc*）会
+    在磁盘写文件（M1：`pmap -n` 实测落 .pmaprc），-X 打印内核地址——全部拒。
+    位置参数与 -p 后跟的必须是 ASCII 数字 pid（AGENTS 沙箱行声称）。"""
+    allowed = {"-x", "-d", "-q", "-p"}
+    for i, a in enumerate(args):
+        if a.startswith("-"):
+            if a in allowed:
+                continue
+            return False, (
+                f"pmap 不允许该选项：{a!r}（rc 文件写面/内核地址选项已拒绝）"
+            )
+        if not (a.isascii() and a.isdigit()):
+            return False, f"pmap 仅接受数字 pid：{a!r}"
+        if i > 0 and args[i - 1] == "-p":
+            continue
+    return True, ""
+
+
 def _systemd_cgtop_ok(args: list[str]) -> tuple[bool, str]:
-    """systemd-cgtop：必须 -b 批量模式（交互态会持续刷新、占住终端）。"""
+    """systemd-cgtop：必须 -b 批量模式（交互态会持续刷新、占住终端）。
+    --machine/-M 与 systemctl 同口径拒绝（借 machine 看别的 systemd 实例）——
+    `-M host` 与 `--machine=xxx` 长短两种形态必须一并拒。"""
     if "-b" not in args and "--batch" not in args:
         return False, "systemd-cgtop 必须加 -b（非交互批量模式）"
     for a in args:
-        if not a.startswith("-") and not a.isdigit():
+        if a == "-M" or a.split("=", 1)[0] == "--machine":
+            return False, "systemd-cgtop 不接受 --machine/-M（只看本机 cgroup）"
+        if not a.startswith("-") and not (a.isascii() and a.isdigit()):
             return False, f"systemd-cgtop 不接受位置参数：{a!r}"
     return True, ""
 
@@ -901,6 +968,10 @@ def permitted(
     if exe in _READONLY_OPS:
         # 只读运维命令：无写文件/执行代码选项（top 的交互写向由 -b 要求排除）
         return True, ""
+    if exe == "pidstat":
+        return _pidstat_ok(args)
+    if exe == "pmap":
+        return _pmap_ok(args)
     if exe == "top":
         return _top_ok(args)
     if exe == "swapon":

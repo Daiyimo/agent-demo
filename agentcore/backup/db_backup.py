@@ -70,6 +70,20 @@ _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _BACKUP_LOCK_NAME = ".backup.lock"
 _PG_DUMP_TIMEOUT = 300  # 秒；pg_dump 整体超时（stdout 流读完 + 进程退出）
 _AGE_MAGIC = b"age-encryption.org/v1"
+# pg_dump 刻意排除的表（单一事实源，恢复演练 drill_restore.py 同源引用）：
+# schema_migrations 是部署元数据而非业务数据——随 dump 恢复会让老备份把账本
+# "倒回"过去，启动时误判迁移已应用；排除后由启动期 runner 按当前代码重建账本
+# （基线幂等），见 agentcore/memory/migrate.py。
+# 统计四表（I2，REVIEW 2026-11-02）"不在备份范围"（agentcore/memory/schema.py）：
+# JSONL 路径只遍历 DATA_TABLES，pg_dump 路径若全量导出则两条路径产物不可互换，
+# 且 keep 按文件数轮换、目录体积闸门只有 mirror 脚本有，NAS 上会把磁盘吃满。
+BACKUP_EXCLUDED_TABLES = (
+    "schema_migrations",
+    "group_msg_daily",
+    "group_word_daily",
+    "group_reviews",
+    "group_messages_raw",
+)
 
 
 def _backup_encryption() -> tuple[str, str] | None:
@@ -513,15 +527,7 @@ def _pg_dump_rest_args(p: dict) -> list[str]:
         "--no-privileges",
         "--clean",
         "--if-exists",
-        # I2（REVIEW 2026-11-02）：统计四表同样排除——它们"不在备份范围"
-        # （agentcore/memory/schema.py:10-11），JSONL 路径只遍历 DATA_TABLES，
-        # pg_dump 路径却全量导出：两条路径产物不可互换，且 keep 按文件数轮换、
-        # 目录体积闸门只有 mirror 脚本有，NAS 上会把磁盘吃满。
-        "--exclude-table=schema_migrations",
-        "--exclude-table=group_msg_daily",
-        "--exclude-table=group_word_daily",
-        "--exclude-table=group_reviews",
-        "--exclude-table=group_messages_raw",
+        *(f"--exclude-table={t}" for t in BACKUP_EXCLUDED_TABLES),
         p["database"],
     ]
 

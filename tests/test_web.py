@@ -4042,6 +4042,23 @@ class TestCronAPI:
         )
         assert r.status_code == 422
 
+    def test_save_challenge_binds_value(self, monkeypatch):
+        """L4：preview(A)+save(B) 换值攻击——确认框显示的值必须=实际写入的值。"""
+        c = self._client(monkeypatch)
+        d, _ = self._save(c, self._payload())
+        # 用 A 的 challenge 写 B 的 payload（改 name 与 cron）
+        swapped = self._payload(name="改过的名")
+        r = c.post(
+            f"{web.PREFIX}/api/cron/save",
+            json={
+                "payload": swapped,
+                "confirm_token": d["confirm_token"],
+                "confirm_nonce": d["confirm_nonce"],
+            },
+        )
+        assert r.status_code == 400
+        assert c.get(f"{web.PREFIX}/api/cron").json()["jobs"][0]["name"] != "改过的名"
+
     def test_trusted_requires_superuser_owner(self, monkeypatch):
         c = self._client(monkeypatch)
         bad = c.post(f"{web.PREFIX}/api/cron/preview", json=self._payload(trusted=True))
@@ -4052,19 +4069,99 @@ class TestCronAPI:
         assert ok.status_code == 200
         assert ok.json()["preview"]["enabled"] is False
 
+    def test_reminder_save_without_store_is_409(self, monkeypatch):
+        """L2：提醒存储未装配时 save 与 delete 同口径 409（修前 AttributeError → 500）。"""
+        c = self._client(monkeypatch)
+        payload = self._payload(kind="reminder")
+        pv = c.post(f"{web.PREFIX}/api/cron/preview", json=payload)
+        assert pv.status_code == 200, pv.text
+        d = pv.json()
+        r = c.post(
+            f"{web.PREFIX}/api/cron/save",
+            json={
+                "payload": payload,
+                "confirm_nonce": d["confirm_nonce"],
+                "confirm_token": d["confirm_token"],
+            },
+        )
+        assert r.status_code == 409
+        assert "提醒存储" in r.json()["detail"]
+
     def test_toggle_and_delete(self, monkeypatch):
         c = self._client(monkeypatch)
         _, saved = self._save(c, self._payload())
         jid = saved.json()["id"]
+        # M4：toggle/delete 与 save 同走两段确认（challenge 绑定 action+id+值）
+        pv = c.post(
+            f"{web.PREFIX}/api/cron/preview",
+            json={
+                "action": "toggle",
+                "kind": "agent_turn",
+                "id": jid,
+                "enabled": False,
+            },
+        )
+        assert pv.status_code == 200
+        r = c.post(
+            f"{web.PREFIX}/api/cron/toggle",
+            json={
+                "kind": "agent_turn",
+                "id": jid,
+                "enabled": False,
+                "confirm_nonce": pv.json()["confirm_nonce"],
+                "confirm_token": pv.json()["confirm_token"],
+            },
+        )
+        assert r.status_code == 200
+        assert c.get(f"{web.PREFIX}/api/cron").json()["jobs"][0]["enabled"] is False
+        pv_del = c.post(
+            f"{web.PREFIX}/api/cron/preview",
+            json={"action": "delete", "kind": "agent_turn", "id": jid},
+        )
+        assert pv_del.status_code == 200
+        r = c.post(
+            f"{web.PREFIX}/api/cron/delete",
+            json={
+                "kind": "agent_turn",
+                "id": jid,
+                "confirm_nonce": pv_del.json()["confirm_nonce"],
+                "confirm_token": pv_del.json()["confirm_token"],
+            },
+        )
+        assert r.status_code == 200
+        assert c.get(f"{web.PREFIX}/api/cron").json()["jobs"] == []
+
+    def test_toggle_delete_require_challenge(self, monkeypatch):
+        """M4/L4：无 challenge 直达、以及 preview(A)+write(B) 换值攻击，都必须 400。"""
+        c = self._client(monkeypatch)
+        _, saved = self._save(c, self._payload())
+        jid = saved.json()["id"]
+        # 无 challenge 直达（修前可行——AGENTS「两段确认」声称的缺口）
         r = c.post(
             f"{web.PREFIX}/api/cron/toggle",
             json={"kind": "agent_turn", "id": jid, "enabled": False},
         )
-        assert r.status_code == 200
-        assert c.get(f"{web.PREFIX}/api/cron").json()["jobs"][0]["enabled"] is False
-        r = c.post(
+        assert r.status_code == 400
+        r_del = c.post(
             f"{web.PREFIX}/api/cron/delete",
             json={"kind": "agent_turn", "id": jid},
         )
-        assert r.status_code == 200
-        assert c.get(f"{web.PREFIX}/api/cron").json()["jobs"] == []
+        assert r_del.status_code == 400
+        assert c.get(f"{web.PREFIX}/api/cron").json()["jobs"] != []
+        # 换值攻击：preview 的是 enabled=True，写入带 enabled=False
+        pv = c.post(
+            f"{web.PREFIX}/api/cron/preview",
+            json={"action": "toggle", "kind": "agent_turn", "id": jid, "enabled": True},
+        )
+        r_swap = c.post(
+            f"{web.PREFIX}/api/cron/toggle",
+            json={
+                "kind": "agent_turn",
+                "id": jid,
+                "enabled": False,
+                "confirm_nonce": pv.json()["confirm_nonce"],
+                "confirm_token": pv.json()["confirm_token"],
+            },
+        )
+        assert r_swap.status_code == 400
+        assert c.get(f"{web.PREFIX}/api/cron").json()["jobs"][0]["enabled"] is True

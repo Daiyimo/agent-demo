@@ -20,7 +20,12 @@ from agentcore.groupstats.raw import (
     reply_to_of,
 )
 
-_DAY = dt.date(2026, 10, 6)
+# M10（REVIEW-e079b8d..3a3ce4a）：曾经是固定 date(2026,10,6)——StatsCollector
+# 默认 retention_days=35，flush 末尾的 _maybe_retention 会清掉早于 35 天的
+# 桶；固定日期一过保留线（2026-11-10 起）对账用例必红（CI 11-07 绿、11-13 红
+# 双时点实锤）。与同文件其它用例（tz.today_date() 相对推导）同口径：取今天
+# 往前 10 天——离保留线 25 天余量，任何一天跑都落在窗口内。
+_DAY = tz.today_date() - dt.timedelta(days=10)
 
 
 class _Seg:

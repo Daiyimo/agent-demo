@@ -30,6 +30,7 @@ class El {
     this.children = []; this.parent = null;
     this.value = (attrs || {}).value || "";
     this.type = (attrs || {}).type || (tag === "input" ? "text" : "");
+    this.style = {}; // 真实 DOM 元素恒有 style（cronTrustedChanged 的 owner 展开要用）
     this.onclick = null; this.listeners = {};
   }
   addEventListener(t, fn) { (this.listeners[t] = this.listeners[t] || []).push(fn); }
@@ -154,6 +155,42 @@ function check(name, cond) {
   const cancelled = await p3;
   check("7a 独立确认取消 resolve(false)", cancelled === false);
   check("7b 无残留弹窗", !modalOpen());
+
+  // 8) M3（REVIEW-e079b8d..3a3ce4a）：trusted 勾选必须真的把 enabled 取消
+  // + 禁用。cronCollect 恒回传 enabled 布尔，后端 `enabled is None → not
+  // trusted` 的默认分支在前端流程下永不触发——「trusted 默认停用」只能由
+  // 前端联动保证。初始化调用（无参）不得改动既有任务的状态。
+  const trustedFnIdx = pageJs.indexOf("function cronTrustedChanged");
+  let trustedFn = "";
+  if (trustedFnIdx >= 0) {
+    let d2 = 0;
+    for (let i = pageJs.indexOf("{", trustedFnIdx); i < pageJs.length; i++) {
+      if (pageJs[i] === "{") d2++;
+      if (pageJs[i] === "}") { d2--; if (d2 === 0) { trustedFn = pageJs.slice(trustedFnIdx, i + 1); break; } }
+    }
+  }
+  if (trustedFn) {
+    eval(trustedFn);
+    const wrap = new El("DIV", { id: "crOwnerWrap" });
+    docShim.body.appendChild(wrap);
+    const cbT = new El("INPUT", { id: "crTrusted", type: "checkbox" });
+    const cbE = new El("INPUT", { id: "crEnabled", type: "checkbox" });
+    cbE.checked = true; // 新建表单初始勾选
+    docShim.body.appendChild(cbT);
+    docShim.body.appendChild(cbE);
+    cronTrustedChanged(); // 初始化：不得动既有 enabled
+    check("8a 初始化不改 enabled", cbE.checked === true);
+    cbT.checked = true;
+    cronTrustedChanged(true); // 用户勾选 trusted
+    check("8b 勾 trusted 取消 enabled", cbE.checked === false);
+    check("8c 勾 trusted 禁用 enabled", cbE.disabled === true);
+    check("8d owner 输入框展开", wrap.style.display === "");
+    cbT.checked = false;
+    cronTrustedChanged(true); // 取消 trusted
+    check("8e 取消 trusted 恢复 enabled 可编辑", cbE.disabled === false);
+  } else {
+    check("8x cronTrustedChanged 可提取", false);
+  }
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

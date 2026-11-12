@@ -291,9 +291,11 @@ def _build_user_text(event, names: dict | None = None) -> str:
             elif t == "video":
                 parts.append("[视频]")
             elif t == "file":
-                name = (
-                    _image_like_file_name(data) or str(data.get("file") or "").strip()
-                )
+                # L7：占位显示名与回声匹配名统一走 _file_seg_name（修前占位
+                # 只认 image_like → file，回传 data 为 {name:"备忘录.txt",
+                # file:"XYZ_abc.txt"} 时 LLM 看到协议端内部缓存名而匹配用
+                # name——两处口径必须一致）。
+                name = _file_seg_name(data)
                 parts.append(f"[文件：{name}]" if name else "[文件]")
             elif t == "json":
                 obj = data.get("data")

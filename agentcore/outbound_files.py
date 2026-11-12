@@ -87,7 +87,15 @@ def is_recent_sent_file(
             if file_id and entry_id and file_id == entry_id:
                 matched = True
             elif name and entry_name and name == entry_name:
-                # 回声没带 file_size 时按文件名匹配（不区分大小）
+                # M2（REVIEW-e079b8d..3a3ce4a）：回声没带 file_size 时按文件名
+                # 兜底——但入站 file_id 与登记 file_id **都确定且不等**时这是
+                # 用户自己发的同名文件（QQ 转发/重传字节一致的形态），必须放行：
+                # 修前「bot 发报告 → 用户把文件发回来说帮我看看」第一次就被静默
+                # 吞掉（已复现），且 test_missing_size_matches_by_name_only 把
+                # 误杀窗口当 feature 锁死了。
+                both_ids_known = bool(file_id and entry_id)
+                if both_ids_known:
+                    continue  # id 都对得上号却不是同一个：不是回声
                 matched = size == 0 or size == entry_size
             if matched:
                 if consume:

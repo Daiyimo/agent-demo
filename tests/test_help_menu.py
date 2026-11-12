@@ -176,3 +176,123 @@ class TestAdminSection:
                 continue
             leaked = [cmd for cmd, _ in rows if cmd in help_menu.ADMIN_ONLY]
             assert not leaked, f"这些 superuser-only 命令混进了「{head}」节：{leaked}"
+
+
+def _superuser_gated_commands() -> set[str]:
+    """AST：handler 内出现 is_superuser( 拒绝判定的整命令集合。
+
+    M5（REVIEW-e079b8d..3a3ce4a）：单向锁只守「ADMIN_ONLY 不泄漏到普通
+    节」——/reset 这类「handler 已收窄 superuser、菜单却列在常用节」的命令
+    从反向漏掉。这里建「on_command 注册变量 → handler」映射反向扫。
+    """
+    out: set[str] = set()
+    for path in sorted(_ADAPTER_DIR.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        var_to_cmd: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Call)
+                and getattr(node.value.func, "id", "") == "on_command"
+                and node.value.args
+                and isinstance(node.value.args[0], ast.Constant)
+            ):
+                continue
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    var_to_cmd[t.id] = str(node.value.args[0].value)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for dec in node.decorator_list:
+                if not (
+                    isinstance(dec, ast.Call)
+                    and isinstance(dec.func, ast.Attribute)
+                    and dec.func.attr == "handle"
+                    and isinstance(dec.func.value, ast.Name)
+                ):
+                    continue
+                var = dec.func.value.id
+                if var not in var_to_cmd:
+                    continue
+                gated = any(
+                    isinstance(n, ast.Call)
+                    and (
+                        getattr(n.func, "id", "") in ("is_superuser", "is_superuser_id")
+                        or (
+                            isinstance(n.func, ast.Attribute)
+                            and n.func.attr in ("is_superuser", "is_superuser_id")
+                        )
+                    )
+                    for n in ast.walk(node)
+                )
+                if gated:
+                    out.add(var_to_cmd[var])
+    return out
+
+
+class TestSuperuserGatedReverseLock:
+    """反向锁：handler 收窄 superuser 的命令必须出现在管理节。
+
+    M5：59a31cb 只加了单向锁（ADMIN_ONLY 不得泄漏），/reset 的 handler
+    早已是 superuser-only 却仍在「常用」节；「定时提醒」自然语言入口在
+    reminder_* 收窄 superuser 后同样误导。两处均已修，此锁防复发。
+
+    静态 AST 分不清「整命令拒绝」与「子命令级分权」（kb 的删除、skill 的
+    install、usage 的明细都是 handler 内 is_superuser，但整命令对普通用户
+    可用）——故用两张显式清单：整命令级必须在管理节；子命令级允许在普通节。
+    **新出现的 gated 命令不登记即红**（逼人归类，而不是静默漏掉）。
+    """
+
+    WHOLE_COMMAND_ONLY = {
+        "/2fa",
+        "/cron",
+        "/openclaw",
+        "/push",
+        "/nudge",
+        "/growth",
+        "/model",
+        "/reboot",
+        "/reset",
+        "/update",
+    }
+    # 子命令级分权：整命令可用、部分子命令 superuser-only（紧凑族/子命令形态）
+    SUBCOMMAND_GATED = {
+        "kb",
+        "persona",
+        "usage",
+        "skillcatalog",
+        "skillinfo",
+        "skillinstall",
+        "skilllist",
+        "skilluninstall",
+        "skills",
+    }
+
+    def test_whole_command_list_is_live(self):
+        """防恒真：清单里每条都得在 AST 扫出的 gated 集合里坐实。"""
+        gated = _superuser_gated_commands()
+        stale = [c for c in self.WHOLE_COMMAND_ONLY if c.lstrip("/") not in gated]
+        assert not stale, f"清单里有 handler 已不收窄的命令（漂移）：{stale}"
+
+    def test_gated_commands_all_in_admin_section(self):
+        from plugins.qq_agent_adapter import help_menu
+
+        sections = {head: {cmd for cmd, _ in rows} for head, rows in help_menu.SECTIONS}
+        admin = sections[help_menu.ADMIN_SECTION]
+        leaked = sorted(cmd for cmd in self.WHOLE_COMMAND_ONLY if cmd not in admin)
+        assert not leaked, f"这些 superuser-only 命令没在管理节：{leaked}"
+
+    def test_new_gated_command_must_be_registered(self):
+        """新增未归类的 gated 命令 → 红（归类到上面两张表之一）。"""
+        gated = _superuser_gated_commands()
+        assert gated, "反向锁扫空了——AST 映射大概率失效（恒真陷阱）"
+        unclassified = sorted(
+            c
+            for c in gated
+            if f"/{c}" not in self.WHOLE_COMMAND_ONLY and c not in self.SUBCOMMAND_GATED
+        )
+        assert not unclassified, (
+            "这些命令 handler 收窄了 superuser 但没归类"
+            f"（整命令级→WHOLE_COMMAND_ONLY，子命令级→SUBCOMMAND_GATED）：{unclassified}"
+        )

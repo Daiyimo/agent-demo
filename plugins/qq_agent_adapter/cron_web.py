@@ -199,6 +199,11 @@ def normalize_payload(payload: dict, superusers: set[str]) -> dict:
             raise CronWebError("trusted 任务必须指定 SUPERUSERS 中的执行身份")
     elif not owner:
         owner = next(iter(sorted(superusers)), "")
+    # L1（REVIEW-e079b8d..3a3ce4a）：owner 非空但非 QQ 号时修前一路裸奔到
+    # jobs 层才被 load 的 _validate_job 拒（JobsError 不是 CronWebError →
+    # web 层 500 裸异常）。这里与 _validate_job 同判据前置校验。
+    if owner and not (owner.isascii() and owner.isdigit()):
+        raise CronWebError("owner 应为纯数字 QQ 号")
     if kind == "reminder" and not owner:
         raise CronWebError("提醒需要一个归属管理员（SUPERUSERS 为空）")
 
@@ -319,10 +324,11 @@ def save_agent_turn(item: dict) -> str:
 
 
 async def save_reminder(item: dict, store) -> str:
-    if item.get("id"):
-        # 提醒没有 update 接口：编辑 = 取消旧的再建一条（id 会变）。
-        await store.schedule_cancel(item["id"], user_id=None)
-    return await store.schedule_add(
+    # M9（REVIEW-e079b8d..3a3ce4a）：提醒没有 update 接口，编辑曾按
+    # 「先取消旧再建新」——cancel 成功而 add 失败（store 异常/条数上限/DB
+    # 抖动）时旧提醒已删、新提醒未建，单条提醒静默丢失。改为**先建后删**：
+    # 失败残留的是旧提醒（可重试），不会丢用户数据。
+    new_id = await store.schedule_add(
         kind="once" if item["freq"] == "once" else "cron",
         target=item["target"],
         message=item["message"],
@@ -331,6 +337,9 @@ async def save_reminder(item: dict, store) -> str:
         next_run=item["next_run_ts"],
         action="remind",
     )
+    if item.get("id") and item["id"] != new_id:
+        await store.schedule_cancel(item["id"], user_id=None)
+    return new_id
 
 
 def toggle_agent_turn(job_id: str, enabled: bool) -> None:
@@ -372,5 +381,19 @@ def run_agent_turn(job_id: str) -> str:
     hit = next((j for j in jobs if j.id == job_id), None)
     if hit is None:
         raise CronWebError("任务不存在（可能已被删除）")
-    asyncio.get_running_loop().create_task(runner.run_job(hit))
-    return f"试跑已发起：{job_id}"
+    # L3（REVIEW-e079b8d..3a3ce4a）：事件循环只持 task 弱引用，长跑 run_job
+    # 有被 GC 中途取消的文档化风险——保存引用，完成即摘（/cron run 试跑同型）。
+    from agentcore.scheduler.cron_admin import _BG_TASKS
+
+    task = asyncio.get_running_loop().create_task(runner.run_job(hit))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    hints = []
+    if hit.delete_after_run:
+        hints.append("一次性任务，跑完即删除")
+    if hit.trusted:
+        hints.append(f"trusted，将以 {hit.owner} 权限真实执行一轮")
+    msg = f"试跑已发起：{job_id}"
+    if hints:
+        msg += "（" + "；".join(hints) + "）"
+    return msg

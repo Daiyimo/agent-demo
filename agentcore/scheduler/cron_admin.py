@@ -15,6 +15,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# L3（REVIEW-e079b8d..3a3ce4a）：cron 试跑后台任务引用集合。asyncio 事件
+# 循环只持 task 弱引用，长跑的 run_job 有被 GC 中途取消的文档化风险
+# （CPython 官方建议保存引用）。web「定时」页试跑与这里共用（agentcore 侧
+# 定义，plugins 层 import 方向不变）。
+_BG_TASKS: set = set()
+
 # 两段确认的内存暂存：token → (时间戳, 数据)；5 分钟过期
 _pending: dict[str, tuple[float, dict]] = {}
 _PENDING_TTL = 300
@@ -290,10 +296,16 @@ def run_cron_action(action: str, rest: str, jobs_path=None, owner: str = "") -> 
         if runner is None:
             return "试跑器未接线（bot 尚未完成启动）。"
         # 后台试跑（run_job 可能要几十秒），立即回执；结果投递到配置的目标，
-        # 状态看 /cron 列表
+        # 状态看 /cron 列表。L3：保存 task 引用（与 web 试跑共用引用集合）。
         import asyncio
 
-        asyncio.get_running_loop().create_task(runner.run_job(hit))
+        task = asyncio.get_running_loop().create_task(runner.run_job(hit))
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+        if hit.delete_after_run:
+            return f"试跑已发起（{jid}）：一次性任务跑完即删除；结果将投递到 {hit.to}，完成后状态见 /cron。"
+        if hit.trusted:
+            return f"试跑已发起（{jid}）：trusted 任务，将以 {hit.owner} 权限真实执行一轮；结果将投递到 {hit.to}。"
         return f"试跑已发起（{jid}）：结果将投递到 {hit.to}，完成后状态见 /cron。"
 
     return f"未知动作：{action}"

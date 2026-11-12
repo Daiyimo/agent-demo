@@ -247,6 +247,7 @@ B 步的 `os.execve` 只带启动时抓的出生环境快照，不会重读文�
   python scripts/backup_db.py backup                 # 立即备份（自动选 pg_dump / JSONL）
   python scripts/backup_db.py list                   # 列出已有备份
   python scripts/backup_db.py restore <file> --yes   # 从备份恢复（显式确认）
+  python scripts/drill_restore.py                    # 恢复演练：灌临时库校验后清场
   ```
 
   web `/agent-web` 的「备份」标签可看列表/最新年龄/磁盘，手动备份、删除非最新一份、

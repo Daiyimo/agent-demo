@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 105 个文件（**4054 收集：3972 通过 + 82 跳过**——`pytest -q` 实测 2026-11-07）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 106 个文件（**4092 收集：4009 通过 + 83 跳过**——`pytest -q` 实测 2026-11-13）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （本机 Windows 同套件实测收集 3896 条：3700 通过 + 105 跳过 + 91 条 Windows 存量环境失败〔须 `PYTHONUTF8=1`
 > + O_NOFOLLOW/fcntl shim 才测得：`os.O_NOFOLLOW` 缺失、GBK locale 读 UTF-8、缺 docker/systemctl/cat/ps/df、
 > WinError1314、st_mode 无 POSIX 权限位、负时间戳 OSError〕；本机 105 条跳过里 28 条是 Windows 专属（POSIX
@@ -278,7 +278,7 @@ key-value override，动 store 双实现契约）；"动 .env" 触碰"全部 env
 | 编号 | 项 | 为什么 | 做 |
 |---|---|---|---|
 | **2.1（P0）** | **PG 侧测试进 CI** ⭐ | 实测 32 个跳过**全部**是 `TEST_DATABASE_URL` 门控，CI 无 PG service → store / restore / replay 这些最危险的代码**零回归保护** | CI 加 `postgres:16`+pgvector service 并导出 `TEST_DATABASE_URL`（conftest 已有防误连生产库断言）；顺带加 3.11/3.12 矩阵 |
-| **2.2（P0）** | **恢复演练脚本** ⭐ | 备份 / 镜像 / restore CLI 都有了，但**从未真恢复过一次**——没演练过的备份等于信仰 | `scripts/drill_restore.py`：定期把最新备份灌进 scratch 库，校验行数/向量一致性并输出报告 |
+| **2.2（P0）** | **恢复演练脚本** ⭐ | ✅ **已落地**（2026-11-08）：① 人工演练通过（生产 `qqagent` 632MB：立即 pg_dump 176M → verify → `agent_demo_scratch` restore → 8 表行数差 0 + 向量指纹一致 → migrate 账本自愈 OK → 清场）；② 固化为 `scripts/drill_restore.py`（find 最新备份 → verify → 建临时库 → restore → 行数对比〔容忍备份后增量 `--max-drift-pct` 默认 10%〕→ 向量抽查〔等距样本 md5 + 维度〕→ migrate 账本自愈 → 成功清场/失败留现场）。写面只有固定名临时库、源库只读、密码不进 stdout（cron 日志安全）；`load_dotenv(find_dotenv(usecwd=True))` 必须在部署目录下跑（否则读到另一份部署的 .env、源库对不上必然红——实测踩过）。回归 `tests/test_drill_restore.py` 23+1PG（变异复核 7/7 必红，台账见该文件末注释）；`BACKUP_EXCLUDED_TABLES` 提为 `db_backup` 模块常量（drill 与 pg_dump 排除清单单一事实源）。**注意**：统计四表与 `schema_migrations` 设计内排除，群聚合历史灾难后不可再生；生产部署在 `/home/xiaji/apps/agent-demo`（库 `qqagent`），与本仓库 `.env` 指向的 `qqagent_dev` 是两个库。**残余（可选）**：挂 systemd timer / crontab 定期自动跑 |
 | 2.3（P1） | **Dockerfile** | README 自己写「根治方案是容器/独立低权用户运行」，但 compose 里只有 `db`，安全声明未兑现 | 单容器 + 非 root + `--cap-drop ALL` + 出口白名单；**不要挂 `docker.sock`**（改用镜像内 `postgresql-client` 直连 `db`） |
 | 2.4（P2） | `/healthz` + 轻量 `/metrics` | fastapi driver 自带 HTTP 服务，成本很低 | turn 数、LLM 耗时、错误率、缓存命中 |
 | 2.5（P2） | `config.yaml` pydantic 校验 + 结构化日志（turn_id 串联） | 字段写错只静默用默认值；一次 turn 的步骤散在各处 INFO | 启动 fail-fast；turn_id 串起 LLM/skill 调用 |
@@ -631,3 +631,17 @@ P1 七组已随 1.0.7 落地（FIX §7/§9，main 侧 commit 号映射见其 §7
 - 线5-L3：e079b8d message「6 节」实为 9 节（已推送不改历史，评审报告 §1 入档即销）
 - 线5-L4：check_changelog env 键取自全仓 diff 的低概率误报窗（本区间零触发）
 - 线5-L6：features-interaction 待决定区条目排版（渲染无碍）
+
+### 6.20 REVIEW-e079b8d..3a3ce4a 修复（2026-11-13，H1 + M×10 + L 必修 11，遗留入档）
+
+来源：[`review/REVIEW-e079b8d..3a3ce4a.md`](review/REVIEW-e079b8d..3a3ce4a.md)，修复见 [`review/FIX-e079b8d..3a3ce4a.md`](review/FIX-e079b8d..3a3ce4a.md)。
+
+**H1 + M×10 + L 必修 11 全修**：H1 `pidstat -e` 任意命令执行（专属校验显式拒 -e + flag 白名单 + ASCII 数字位置参数，双档复现实锤翻转）；M1 pmap rc 写面（`-n/-N/-C` 拒 + 数字 pid）；M2 回声误杀（双方 file_id 均确定且不等时不落 name 兜底）；M3 web 表单 trusted 默认停用端到端（前端联动 + DOM shim 断言）；M4 toggle/delete 补两段确认（challenge 绑定 action+id+值）；M5 help 分节反向锁（AST 双形态 is_superuser/is_superuser_id + 显式归类清单）；M6 drill 测试隐式依赖 data/backups；M7 CHANGELOG [未发布] 段重写；M8 XM-4/XM-5 入档（本条）+ 两处 patch 声称勘误；M9 提醒编辑先建后删；M10 `_DAY` 改相对推导（撞 retention 35 天线必红）。L 批：L1 owner 前置校验、L2 reminder store 预检、L4 换值攻击 + run 端点、L7 占位名统一、L8 弱断言、L9 cgtop machine 拒、L10 iostat -f 注释、L11 drill 异常路径清场提示、L12 变异台账补齐、L13/L14 演练文档三条限制。
+
+**显式遗留（有意不修，理由如下）**：
+- **XM-4**（REVIEW-6867995..e079b8d-cross）：jobs.json flock 假阳性偶现竞态（cross 轮实测 8 跑 2 中）——锁语义本身正确，假阳性方向是多等一次而非双写；需复现根因（futex/网络 fs 时序）后修，单独一批
+- **XM-5**（同报告）：`runtime.patch` 在 reset 后 `git apply` 有失败形态（cross 轮已复现）——原文副本兜底已在文档三处如实化（self_update docstring 本就有、operations/CHANGELOG 本轮补齐）；彻底修法是备份改「全量原文 + 删除式 diff」或改备份格式，属 /update 回滚面重构，进选题池
+- 本轮 L5：M2 修复只盖新写入，存量库 `role=tool` 原文行的历史重放仍不过围栏（靠预算窗口滚出自然衰减；彻底修需在 `_project_history` 补围栏，误伤面与成本需权衡）
+- 本轮 L6：outbox `MAX_LINES=500` 截断与 M6 后「uncertain 行保留多轮」的语义张力（生产单机远达不到 500 条/通知失败周期；随下一次 outbox 触碰时顺手）
+- 本轮 L3：cron 试跑 `create_task` 不保存引用（与 `/cron run` 同模式，非本批引入；GC 取消是文档化风险，集中后台任务引用管理单独一批）
+- XM-1/XM-2/XM-3 在 CHANGELOG 1.0.9「已知待修」段显式立案（bot.py 启动顺序/sink 时序、`[echo]` 超时分支不可达、/update 并发覆写账目）——下版前修，不重复展开
