@@ -4528,10 +4528,20 @@ function cronFreqChanged() {
   cronTrustedChanged();
 }
 
-function cronTrustedChanged() {
+function cronTrustedChanged(user) {
   const t = document.getElementById("crTrusted");
   const w = document.getElementById("crOwnerWrap");
   if (w) w.style.display = t && t.checked ? "" : "none";
+  // M3（REVIEW-e079b8d..3a3ce4a）：trusted 任务必须「先停用落盘，保存后手动
+  // 启用」。cronCollect 恒回传 enabled 布尔（永不为 null），后端
+  // `enabled is None → not trusted` 的默认分支在前端流程下永不触发——
+  // 必须由前端真的把开关取消并禁用。仅用户勾选时联动（user=true）；
+  // 表单初始化调用不带参：编辑既有 trusted+enabled 任务时如实显示其状态。
+  const e = document.getElementById("crEnabled");
+  if (user && e && t) {
+    e.checked = !t.checked;
+    e.disabled = t.checked;
+  }
 }
 
 function cronFormBody(f) {
@@ -4578,7 +4588,7 @@ function cronFormBody(f) {
         '<option value="group"' + sel("group", tk) + ">群聊</option></select>" +
       '<input id="crTargetId" class="mfield__input mono" value="' + esc(tid) +
         '" placeholder="QQ 号 / 群号"></div>') +
-    field("执行权限", '<label><input type="checkbox" id="crTrusted" onchange="cronTrustedChanged()"' +
+    field("执行权限", '<label><input type="checkbox" id="crTrusted" onchange="cronTrustedChanged(true)"' +
       (f.trusted ? " checked" : "") + '> trusted（超管权限执行）</label>',
       "trusted 可调 run_shell/db_query 等；新建时默认停用，需保存后手动启用") +
     '<div id="crOwnerWrap" style="display:none">' +
@@ -4715,7 +4725,22 @@ async function cronSubmit() {
 }
 
 async function cronToggle(id, enabled) {
-  const r = await doPost("api/cron/toggle", { kind: "agent_turn", id: id, enabled: enabled });
+  const ok = await confirmDialog(enabled ? "确认启用" : "确认停用",
+    '<div class="mfield"><span class="mfield__label">' + esc(id) + "</span>" +
+    '<div class="mfield__hint">' + (enabled ? "启用后到点自动执行。" : "停用后不再自动执行，可随时重新启用。") + "</div></div>",
+    "确认");
+  if (!ok) return;
+  // M4：与 save 同机制——先 preview 拿 challenge，再带 challenge 写入
+  const pv = await doPost("api/cron/preview",
+    { action: "toggle", kind: "agent_turn", id: id, enabled: enabled });
+  if (pv.status !== 200) {
+    toast("失败：" + (pv.data.detail || JSON.stringify(pv.data)), "err");
+    return;
+  }
+  const r = await doPost("api/cron/toggle", {
+    kind: "agent_turn", id: id, enabled: enabled,
+    confirm_token: pv.data.confirm_token, confirm_nonce: pv.data.confirm_nonce,
+  });
   if (r.status !== 200) {
     toast("失败：" + (r.data.detail || JSON.stringify(r.data)), "err");
     return;
@@ -4739,7 +4764,16 @@ async function cronDelete(kind, id) {
     '<div class="mfield__hint">删除后不可恢复，正在运行的任务不受影响。</div></div>',
     "确认删除");
   if (!ok) return;
-  const r = await doPost("api/cron/delete", { kind: kind, id: id });
+  // M4：删除同走两段确认（challenge 绑定 kind+id）
+  const pv = await doPost("api/cron/preview", { action: "delete", kind: kind, id: id });
+  if (pv.status !== 200) {
+    toast("失败：" + (pv.data.detail || JSON.stringify(pv.data)), "err");
+    return;
+  }
+  const r = await doPost("api/cron/delete", {
+    kind: kind, id: id,
+    confirm_token: pv.data.confirm_token, confirm_nonce: pv.data.confirm_nonce,
+  });
   if (r.status !== 200) {
     toast("失败：" + (r.data.detail || JSON.stringify(r.data)), "err");
     return;
@@ -5780,6 +5814,49 @@ def _mount_cron_write_routes(app, _auth) -> None:
     @app.post(f"{PREFIX}/api/cron/preview", dependencies=[Depends(_auth)])
     async def _cron_preview(request: Request) -> JSONResponse:
         raw = await _read_json(request)
+        # M4（REVIEW-e079b8d..3a3ce4a）：toggle/delete 与 save 同走两段确认——
+        # AGENTS「定时页写操作两段确认」声称此前只覆盖 save，启停/删除绕过
+        # 页面即可直达。preview 按 action 分流：save 用完整表单 normalize；
+        # toggle/delete 只绑「操作对象 + 目标值」，防确认框与实际写入不一致。
+        action = str(raw.get("action") or "save")
+        if action in ("toggle", "delete"):
+            kind = str(raw.get("kind") or "agent_turn")
+            jid = str(raw.get("id") or "")
+            enabled = bool(raw.get("enabled"))
+            if action == "toggle" and kind != "agent_turn":
+                raise HTTPException(
+                    status_code=400, detail="reminder_toggle_unsupported"
+                )
+            if not jid:
+                raise HTTPException(status_code=422, detail="missing_id")
+            bound = json.dumps(
+                {"action": action, "kind": kind, "id": jid, "enabled": enabled},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            nonce = secrets.token_hex(8)
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(nonce, f"cron_{action}", bound),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "preview": {
+                        "name": jid,
+                        "kind": kind,
+                        "cron": "",
+                        "next_run_text": "",
+                        "target": "",
+                        "trusted": False,
+                        "enabled": enabled,
+                        "summary": ("启用" if enabled else "停用")
+                        if action == "toggle"
+                        else "删除",
+                        "delete_after_run": False,
+                    },
+                }
+            )
         try:
             item = cron_web.normalize_payload(raw, _superusers())
         except cron_web.CronWebError as e:
@@ -5827,11 +5904,20 @@ def _mount_cron_write_routes(app, _auth) -> None:
 
         try:
             if item["kind"] == "reminder":
+                if _store() is None:
+                    # L2：与 delete 端点同口径的 None 预检（修前 AttributeError → 500）
+                    raise cron_web.CronWebError("提醒存储不可用")
                 target = await cron_web.save_reminder(item, _store())
             else:
                 target = cron_web.save_agent_turn(item)
         except cron_web.CronWebError as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
+        except Exception as e:
+            # L1：JobsError（写后重读校验失败已自动回滚）等底层异常转 409，
+            # 不再裸 500——数据面已被 save() 的回滚兜住，这里只补可读文案。
+            raise HTTPException(
+                status_code=409, detail=f"{type(e).__name__}: {e}"
+            ) from e
         _record(
             "cron_web_saved",
             job_kind=item["kind"],
@@ -5849,6 +5935,19 @@ def _mount_cron_write_routes(app, _auth) -> None:
         enabled = bool(raw.get("enabled"))
         if kind != "agent_turn":
             raise HTTPException(status_code=400, detail="reminder_toggle_unsupported")
+        err = _consume_confirm(
+            str(raw.get("confirm_nonce") or ""),
+            str(raw.get("confirm_token") or ""),
+            "cron_toggle",
+            json.dumps(
+                {"action": "toggle", "kind": kind, "id": jid, "enabled": enabled},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
         try:
             cron_web.toggle_agent_turn(jid, enabled)
         except cron_web.CronWebError as e:
@@ -5863,6 +5962,19 @@ def _mount_cron_write_routes(app, _auth) -> None:
         raw = await _read_json(request)
         kind = str(raw.get("kind") or "agent_turn")
         jid = str(raw.get("id") or "")
+        err = _consume_confirm(
+            str(raw.get("confirm_nonce") or ""),
+            str(raw.get("confirm_token") or ""),
+            "cron_delete",
+            json.dumps(
+                {"action": "delete", "kind": kind, "id": jid, "enabled": False},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
         try:
             if kind == "reminder":
                 store = _store()

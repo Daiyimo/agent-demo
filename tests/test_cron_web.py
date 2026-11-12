@@ -111,6 +111,46 @@ class TestNormalize:
     def test_trusted_defaults_disabled(self):
         item = cron_web.normalize_payload(_base(trusted=True, owner="10000"), {"10000"})
         assert item["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_run_agent_turn_saves_task_ref_and_hints(self, monkeypatch, tmp_path):
+        """L3：试跑保存 task 引用（GC 取消风险）；once/trusted 提示文案。"""
+        import asyncio
+
+        from agentcore.scheduler import cron_admin
+
+        monkeypatch.setenv("SUPERUSERS", "10000")
+        monkeypatch.setenv("AGENT_CRON_DIR", str(tmp_path))
+        item = cron_web.normalize_payload(
+            _base(freq="once", date="2026-11-20", trusted=True, owner="10000"),
+            {"10000"},
+        )
+        jid = cron_web.save_agent_turn(item)
+        assert jid, "save 必须返回新 id"
+
+        calls: list[str] = []
+
+        class _Runner:
+            async def run_job(self, hit):
+                calls.append(hit.id)
+                return "ok"
+
+        cron_admin._RUNNER_REF[:] = [_Runner()]
+        try:
+            msg = cron_web.run_agent_turn(jid)
+            assert "试跑已发起" in msg
+            assert "一次性任务" in msg, "once 任务试跑会跑完即删，必须提示"
+            assert "权限真实执行" in msg, "trusted 试跑以 owner 权限执行，必须提示"
+            assert len(cron_admin._BG_TASKS) == 1, "task 引用必须保存"
+            await asyncio.sleep(0.05)
+            assert calls == [jid], "试跑必须真的触发 run_job"
+            assert len(cron_admin._BG_TASKS) == 0, "完成后摘除引用"
+        finally:
+            cron_admin._RUNNER_REF[:] = [None]
+        """L1：非 QQ 号 owner 前置拒（修前裸奔到 jobs 层 JobsError → web 500）。"""
+        for bad in ("not-a-number", "abc123", "１２３"):
+            with pytest.raises(cron_web.CronWebError):
+                cron_web.normalize_payload(_base(owner=bad), {"10000"})
         item2 = cron_web.normalize_payload(
             _base(trusted=True, owner="10000", enabled=True), {"10000"}
         )
@@ -197,10 +237,17 @@ class _FakeStore:
     def __init__(self):
         self.added: list[dict] = []
         self.cancelled: list[tuple] = []
+        self._next_id = 0
+        self.fail_add = False
 
     async def schedule_add(self, **kw):
+        if self.fail_add:
+            raise RuntimeError("store 不可用（模拟 add 失败）")
         self.added.append(kw)
-        return "r1"
+        # M9：真实 store 的 schedule_add 必返回**新** id（与旧 id 不同）——
+        # 旧假 store 恒返回 "r1"，会让「先建后删」守卫把 cancel 跳过。
+        self._next_id += 1
+        return f"r{self._next_id}"
 
     async def schedule_cancel(self, sid, user_id=None):
         self.cancelled.append((sid, user_id))
@@ -239,6 +286,25 @@ class TestReminder:
         )
         await cron_web.save_reminder(item2, store)
         assert store.cancelled == [("r1", None)]
+
+    @pytest.mark.asyncio
+    async def test_edit_add_failure_keeps_old_reminder(self, cron_dir):
+        """M9：编辑提醒时「先建后删」——add 失败不得取消旧提醒。"""
+        store = _FakeStore()
+        item = cron_web.normalize_payload(
+            _base(kind="reminder", message="喝水", freq="daily", time="09:00"),
+            {"10000"},
+        )
+        assert await cron_web.save_reminder(item, store) == "r1"
+        store.fail_add = True
+        item2 = cron_web.normalize_payload(
+            _base(id="r1", kind="reminder", message="喝水2", freq="daily"),
+            {"10000"},
+        )
+        with pytest.raises(RuntimeError):
+            await cron_web.save_reminder(item2, store)
+        assert store.cancelled == [], "add 失败不得动旧提醒"
+        assert len(store.added) == 1, "add 失败不得留下半条新提醒"
 
     @pytest.mark.asyncio
     async def test_list_all_filters_reminders(self, cron_dir):
