@@ -32,6 +32,7 @@ ADMIN_ONLY = frozenset(
         "/growth",
         "/model",
         "/reboot",
+        "/reset",
         "/update",
     }
 )
@@ -66,7 +67,6 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         "常用",
         (
             ("/help", "本菜单（「帮助」/ /aihelp 同效）"),
-            ("/reset", "重置当前会话"),
             ("/status", "运行状态与今日 LLM 用量"),
             ("/usage", "今日用量明细表"),
             ("/memory", "查看 / 删除自己的长期记忆"),
@@ -83,10 +83,7 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ),
     (
         "提醒与娱乐",
-        (
-            ("定时提醒", "直接说「每天 9 点提醒我喝水」"),
-            ("点歌 / 放歌", "直接说「点歌 海阔天空」（需开启点歌）"),
-        ),
+        (("点歌 / 放歌", "直接说「点歌 海阔天空」（需开启点歌）"),),
     ),
     (
         ADMIN_SECTION,
@@ -99,6 +96,7 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("/growth", "管理人格成长层"),
             ("/model", "切换模型"),
             ("/reboot", "重启 bot"),
+            ("/reset", "重置当前会话（清自己的历史）"),
             ("/update", "更新代码并重启（失败自动回滚；/update status 查看）"),
         ),
     ),
