@@ -103,9 +103,7 @@ def _isolate_notify_budget(monkeypatch, tmp_path):
     import agentcore.scheduler.notify_budget as nb_mod
 
     monkeypatch.delenv("AGENT_NOTIFY_DAILY_LIMIT", raising=False)
-    monkeypatch.setenv(
-        "AGENT_NOTIFY_BUDGET_FILE", str(tmp_path / "notify-budget.json")
-    )
+    monkeypatch.setenv("AGENT_NOTIFY_BUDGET_FILE", str(tmp_path / "notify-budget.json"))
     monkeypatch.setattr(nb_mod, "_default", nb_mod.NotifyBudget())
 
 

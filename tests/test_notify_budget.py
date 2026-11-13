@@ -292,6 +292,7 @@ class TestEnvDefaults:
         assert nb.KEEP_DAYS >= 1
         assert nb.MAX_TARGETS_PER_DAY >= 1
 
+
 class TestBlocked:
     """P4 的 blocked 段：被全局闸拦下的计数。与 days 同构但**不参与 spent**。
 
@@ -370,7 +371,9 @@ class TestBlocked:
         b = nb.NotifyBudget(path)
         now = time.time()
         b.record_blocked("group:2", "push", now)
-        assert b.blocked_by_kind("group:2", now) == {"push": 1}, "当天桶被未来日键挤掉了"
+        assert b.blocked_by_kind("group:2", now) == {"push": 1}, (
+            "当天桶被未来日键挤掉了"
+        )
         assert set(b._blocked) == {today}
 
     def test_record_blocked_failure_never_explodes(self, tmp_path, monkeypatch, caplog):
@@ -392,5 +395,3 @@ class TestBlocked:
         b = _mk(tmp_path)
         assert b.blocked_snapshot()["targets"] == {}
         assert b.snapshot()["targets"] == {}
-
-

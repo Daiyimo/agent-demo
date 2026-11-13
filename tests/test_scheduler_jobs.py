@@ -903,6 +903,8 @@ class TestStateSidecar:
         p = tmp_path / "jobs.json"
         J.save([_cron_job()], p)
         assert not J.state_path(p).exists()
+
+
 class TestNotifyBudgetGate:
     """P3：agent_turn 也受全局打扰预算约束（此前 jobs.json 完全没有上限）。
 
@@ -979,6 +981,7 @@ class TestNotifyBudgetGate:
             await runner.run_job(J.load(p)[0][0])
             await runner.run_job(J.load(p)[0][0])
         assert caplog.text.count("打扰预算") == 1, caplog.text
+
     @pytest.mark.asyncio
     async def test_blocked_is_counted_separately(self, tmp_path, monkeypatch, caplog):
         """P4：被拦下的那一轮要单独记账（blocked 段），且不占 spent。"""
@@ -998,4 +1001,3 @@ class TestNotifyBudgetGate:
         assert budget.spent("group:123") == 1
         snap = budget.blocked_snapshot()
         assert snap["targets"]["group:123"] == {"total": 1, "agent_turn": 1}
-

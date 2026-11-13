@@ -1174,7 +1174,6 @@ class TestPushDailyCapPersistence:
     def test_legacy_state_imported_once(self, tmp_path):
         """旧 push 记账文件一次性搬进共享预算，且不重复导入（翻倍=上限砍半）。"""
         import json
-        import time as _t
 
         from agentcore.memory.store import InMemoryMemoryStore
         from agentcore.scheduler.notify_budget import get_notify_budget
@@ -1182,9 +1181,7 @@ class TestPushDailyCapPersistence:
 
         legacy = tmp_path / "push-state.json"
         legacy.write_text(
-            json.dumps(
-                {get_notify_budget().day_key(): {"g:1": 2}}, ensure_ascii=False
-            ),
+            json.dumps({get_notify_budget().day_key(): {"g:1": 2}}, ensure_ascii=False),
             encoding="utf-8",
         )
 
@@ -1197,6 +1194,7 @@ class TestPushDailyCapPersistence:
 
         asyncio.run(_run())
         assert get_notify_budget().by_kind("g:1") == {"push": 2}
+
     def test_own_cap_hit_is_not_budget_blocked(self, tmp_path):
         """细分上限（daily_cap_per_target）命中也拦，但**不记** blocked——
 
@@ -1245,7 +1243,6 @@ class TestPushDailyCapPersistence:
             assert snap["targets"]["g:1"] == {"total": 1, "push": 1}
 
         asyncio.run(_run())
-
 
 
 class TestUncertainNoResend:
@@ -1477,6 +1474,8 @@ class TestUnifiedDisplayClock:
         monkeypatch.setenv("AGENT_SCHEDULER_TZ", "Asia/Shanghai")
         ts = dt.datetime(2026, 10, 11, 12, 0, tzinfo=dt.UTC).timestamp()
         assert tz.fmt_ts(ts, "%Y-%m-%d %H:%M") == "2026-10-11 20:00"
+
+
 class TestNotifyBudgetWiring:
     """P3：reminder 只记账不拦（用户显式预约的时间不该被全局预算吞掉）。
 

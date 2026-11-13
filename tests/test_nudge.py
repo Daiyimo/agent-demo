@@ -2356,6 +2356,8 @@ class TestGenerationRace:
         )
         assert st["last_skip_reason"] == "active"
         assert st["unanswered"] == 0
+
+
 class TestNotifyBudgetGate:
     """P3：nudge 也受全局打扰预算约束（push/agent_turn 先用掉额度时顺延不停用）。
 
@@ -2407,19 +2409,19 @@ class TestNotifyBudgetGate:
         """uncertain 不计全局账（uncertain 分支只消耗自己的当日配额）。"""
         first = _at(9, 0)
         await _user_said(store, "早", first)
-        svc, sink, _eng = await _service(
-            store, sink=_FakeSink(outcomes=["uncertain"])
-        )
+        svc, sink, _eng = await _service(store, sink=_FakeSink(outcomes=["uncertain"]))
         await svc.tick(now=first + 60)
         row = await _row(store)
         await store.schedule_mark_fired(row["id"], row["next_run"])
         out = await svc.tick(now=row["next_run"] + 1)
         assert out["skipped"] == 1, "uncertain 归入 skipped（没有独立计数键）"
         assert svc._budget.by_kind(TARGET) == {}
+
     @pytest.mark.asyncio
     async def test_blocked_is_counted_separately(self, store):
         """P4：被拦下的那次单独记 blocked 段，且不占 spent。"""
         from agentcore.scheduler.notify_budget import NotifyBudget
+
         first = _at(9, 0)
         await _user_said(store, "早", first)
         svc, sink, _eng = await _service(store, cfg=_cfg(daily_cap_normal=0))
@@ -2442,4 +2444,3 @@ class TestNotifyBudgetGate:
         assert svc._budget.spent(TARGET) == 2, "被拦那次不占额度"
         snap = svc._budget.blocked_snapshot()
         assert snap["targets"][TARGET] == {"total": 1, "nudge": 1}
-
