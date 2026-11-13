@@ -35,6 +35,7 @@ README 只讲「是什么、怎么跑、必配什么」，细节走下面的链�
 | [docs/features-interaction.md](docs/features-interaction.md) | 人格系统与成长层、点歌/放歌、Web 总览与全部设置、本机概览（戳一戳） |
 | [docs/memory-and-persona.md](docs/memory-and-persona.md) | 记忆与人格详解（当前状态）：七路数据来源、system prompt 组装顺序即优先级 |
 | [docs/GENERAL-GUIDELINES.md](docs/GENERAL-GUIDELINES.md) | 从本仓库纪律提炼的通用工程规范（可迁移到其它项目） |
+| [docs/specs/qq-federated-team.md](docs/specs/qq-federated-team.md) | **待实现 Spec**：框架吸收、跨服务器 QQ 群友军协作、派工/review/校验/issue，含分期与验收标准 |
 | [AGENTS.md](AGENTS.md) / [CONTRIBUTING.md](CONTRIBUTING.md) / [BACKLOG.md](BACKLOG.md) | 接手者边界与不变量 / 提交流程 / 待办与已实证缺陷 |
 | [review/REVIEW-WORKFLOW.md](review/REVIEW-WORKFLOW.md) | 增量评审规范与历史评审/修复索引 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更与阶段里程碑 |

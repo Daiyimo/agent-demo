@@ -196,6 +196,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | `BACKLOG.md` | 还没做的事（§1–§5）+ 已实证缺陷（§6，含 §6.1 规范审查、§6.2 小项） |
 | `docs/memory-and-persona.md` | **记忆与人格详解（当前状态）**：七路数据来源、system prompt 组装顺序即优先级、人格/成长层机制、作用域隔离、安全约定、配置总表（含表关系与索引） |
 | `docs/GENERAL-GUIDELINES.md` | 从本仓库纪律/评审规范提炼的**通用工程规范**（可迁移到其它项目；专属项映射见其 §8） |
+| `docs/specs/qq-federated-team.md` | **待实现 Spec**：框架吸收与跨服务器 QQ 群协作的可行性、信任/权限边界、32 条需求、分期与验收标准 |
 | `review/REVIEW-*.md` | 各轮评审报告（按 commit 区间命名，问题都带复现证据） |
 | `review/FIX-*.md` | 对应修复记录：改法、验证命令、剩余项 |
 | `review/REVIEW-WORKFLOW.md` | 多子代理评审 → 主代理复核的流程约定 |
