@@ -3,6 +3,7 @@
 来源：全量群消息归档 AC §A/B/C。缓冲逻辑用内存假 store（无 PG 依赖也能跑）；
 PG 独有面（DDL/索引查询/JSON 往返）在 TEST_DATABASE_URL 存在时执行，TRUNCATE
 隔离。AC §D（点评增强）在 test_group_stats_review.py / route 测试里。
+回归来源：UGREEN CI #34（2026-11-13），对账夹具不得随真实日期过期。
 """
 
 import datetime as dt
@@ -378,10 +379,13 @@ class TestPgStore:
         assert len(await store.query("456", None, _DAY, _DAY, 10)) == 1
 
     @pytest.mark.asyncio
-    async def test_recompute_matches_live_stats(self, store):
+    async def test_recompute_matches_live_stats(self, store, monkeypatch):
         """C17：归档原文重算 == 实时聚合（同一批消息两条路径）。"""
         from agentcore.groupstats.collector import StatsCollector
         from agentcore.groupstats.store import InMemoryStatsStore
+
+        # 对账只比较两条写入路径；真实时钟会把固定日期的聚合当作过期数据清掉。
+        monkeypatch.setattr(tz, "today_date", lambda: _DAY)
 
         messages = [
             ("u1", "服务器又炸了"),
@@ -407,7 +411,7 @@ class TestPgStore:
         live = await stats.user_ranking("456", _DAY, _DAY, 10)
         live_map = {r["user_id"]: r["msgs"] for r in live}
         recomputed = {u: v["msgs"] for u, v in out["per_user"].items()}
-        assert recomputed == live_map
+        assert recomputed == live_map == {"u1": 2, "u2": 1}
         # 词频也对得上
         freq = await stats.word_freq("456", _DAY, _DAY, 10)
         live_words = dict(freq)

@@ -556,3 +556,15 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 修法 | ① 步数耗尽后追加一次 `tools=None` 收尾调用：提示模型不要再请求工具、基于已有信息回答；收尾仍空才回原兜底。② 一轮内 `summarize_url`/`fetch_url` 连续失败 3 次 → 停用两个抓取工具 + 注入「用已有搜索结果回答」提示。③ `agent.max_iterations` 移到 Web「模型与 LLM」簇并改名「思考步数」，写入后热更新运行中 engine（`config_yaml.apply_runtime`），不必重启。 |
 | 回归 | `tests/test_engine.py::TestAbortWording`（强制收尾 / 空收尾兜底 / 抓取预算）、`tests/test_config_yaml.py::TestApplyRuntime`、`tests/test_web.py::TestSettingsWrite::test_yaml_write_roundtrip_and_live_label`；三条关键路径均做「改坏必红」复核。 |
 | 文档 | `docs/features-messaging.md`（tool-loop 止损 ④⑤）、`docs/features-interaction.md`（Web 设置生效时机）、`CHANGELOG.md`。 |
+
+### 6.18 UGREEN CI：归档对账夹具随真实日期过期（2026-11-13）
+
+| 项 | 内容 |
+|---|---|
+| 等级与来源 | Medium；[CI #34](https://github.com/Daiyimo/agent-demo/actions/runs/43401284857)，head aaa8d0c，失败于 test_group_archive.py 的 test_recompute_matches_live_stats。 |
+| verified：复现 | 全新本地 pgvector/PG16 测试容器、qqagent_test 空库，运行 python -m pytest tests/test_group_archive.py::TestPgStore::test_recompute_matches_live_stats -q：1 failed；归档重算为 u1=2/u2=1，实时聚合为空，与 CI 一致。 |
+| high → verified：根因 | 夹具日期固定 2026-10-06，StatsCollector.flush 按真实今天执行默认 35 天保留期清理；2026-11-13 时固定数据已过期。单独运行真实 collector 也得到 ranking=[]。 |
+| 修法与语义 | 仅在对账用例内将 tz.today_date 固定为夹具日；对账断言由“两边相等”加强为“两边均等于 u1=2/u2=1”。生产保留期、采集/查询逻辑不变。 |
+| verified：回归与变异 | 带 TEST_DATABASE_URL 运行 python -m pytest tests/test_group_archive.py -q：38 passed；将隔离测试 checkout 的 recompute_window 计数故意从 +=1 改为 +=2，同一主题套件变为 2 failed / 36 passed，包含该 PG 对账用例；随后按字节恢复原实现。 |
+| verified：完整门禁 | Linux/Python 3.12、全新空 qqagent_test：python -m pytest -q --cov=agentcore --cov-report=term-missing --cov-fail-under=80 为 3602 passed / 9 skipped，覆盖率 89.83%；ruff check / format --check 通过（239 files），pyright 为 0 errors；python scripts/check_review_docs.py --check-stats 通过，默认套件计数仍为 92 文件 / 3589 收集：3516 通过 + 73 跳过。 |
+| 后续实现依据 | [QQ 群联邦协作 Spec](docs/specs/qq-federated-team.md) 已归档；32 条需求仍待实现，CI 修复不包含 Team 源码开发。 |
